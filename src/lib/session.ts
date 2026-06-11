@@ -3,9 +3,17 @@ import { cookies } from "next/headers";
 import type { SteamProfile } from "@/lib/steam/openid";
 
 export interface SessionData {
+  // Steam
   steamId?: string;
   profile?: SteamProfile;
   isLoggedIn: boolean;
+  // Notion OAuth
+  notionToken?: string;
+  notionWorkspaceId?: string;
+  notionWorkspaceName?: string;
+  notionWorkspaceIcon?: string | null;
+  // Anti-CSRF pour le flow Notion
+  notionOAuthState?: string;
 }
 
 export const sessionOptions: SessionOptions = {

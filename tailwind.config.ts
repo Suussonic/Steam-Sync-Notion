@@ -1,15 +1,3 @@
-import { type Config } from "tailwindcss";
-
-const config: Config = {
-  content: [
-    "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
-    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
-    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
-  ],
-  theme: {
-    extend: {},
-  },
-  plugins: [],
-};
-
-export default config;
+// Tailwind v4 — la configuration se fait via CSS (@import "tailwindcss" dans globals.css)
+// Ce fichier n'est pas utilisé en v4 avec @tailwindcss/postcss
+export default {};

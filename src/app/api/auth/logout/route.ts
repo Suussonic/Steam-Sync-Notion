@@ -3,6 +3,6 @@ import { getSession } from "@/lib/session";
 
 export async function GET(request: NextRequest) {
   const session = await getSession();
-  session.destroy();
+  await session.destroy();
   return NextResponse.redirect(new URL("/", request.url));
 }
