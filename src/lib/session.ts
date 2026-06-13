@@ -14,6 +14,18 @@ export interface SessionData {
   notionWorkspaceIcon?: string | null;
   // Anti-CSRF pour le flow Notion
   notionOAuthState?: string;
+  // Steam → Notion sync state
+  notionSyncPageId?: string;
+  notionSyncPageUrl?: string;
+  notionLibraryDbId?: string;
+  notionAchievementsDbId?: string;
+  notionProfilePageId?: string;
+  notionWishlistDbId?: string;
+  notionFriendsDbId?: string;
+  notionBadgesDbId?: string;
+  notionInventoryDbId?: string;
+  lastSyncAt?: string;
+  lastSyncStats?: { games: number; achievements: number };
 }
 
 export const sessionOptions: SessionOptions = {
