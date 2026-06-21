@@ -307,6 +307,7 @@ export interface AppDetails {
   supported_languages?: string;
   dlc?: number[];
   achievements?: { total: number };
+  screenshots?: Array<{ id: number; path_thumbnail: string; path_full: string }>;
 }
 
 /**
@@ -400,27 +401,47 @@ export interface WishlistItem {
 
 /** Player wishlist. Returns empty array if the wishlist is private or not found. */
 export async function getWishlist(steamId: string): Promise<WishlistItem[]> {
+  // Primary: authenticated Steam Web API (works regardless of privacy setting)
+  try {
+    const data = await steamFetch<{
+      response?: {
+        items?: Array<{ appid: number; priority: number; date_added: number }>;
+      };
+    }>("IWishlistService/GetWishlist/v1/", { steamid: steamId });
+    if (data?.response?.items && data.response.items.length > 0) {
+      return data.response.items.map((item) => ({
+        appid: item.appid,
+        priority: item.priority ?? 0,
+        added: item.date_added ?? 0,
+      }));
+    }
+  } catch {
+    // Fall through to Store API
+  }
+
+  // Fallback: Store API (public wishlists only)
   const all: WishlistItem[] = [];
   try {
     let page = 0;
     while (true) {
       const url = `https://store.steampowered.com/wishlist/profiles/${steamId}/wishlistdata/?p=${page}`;
-      const res = await fetch(url, { cache: "no-store" });
+      const res = await fetch(url, {
+        cache: "no-store",
+        headers: { "User-Agent": "SteamTrackerNotion/1.0" },
+      });
       if (!res.ok) break;
-      // Steam returns {} or { success: 2 } when wishlist is empty/private
-      const raw = await res.json();
+      const raw = (await res.json()) as Record<string, unknown>;
       if (!raw || typeof raw !== "object") break;
-      const data = raw as Record<string, { priority?: number; added?: number }>;
-      const entries = Object.entries(data).filter(([k]) => /^\d+$/.test(k));
+      const entries = Object.entries(raw).filter(([k]) => /^\d+$/.test(k));
       if (entries.length === 0) break;
       for (const [appid, item] of entries) {
+        const obj = item as { priority?: number; added?: number };
         all.push({
           appid: parseInt(appid, 10),
-          priority: item.priority ?? 0,
-          added: item.added ?? 0,
+          priority: obj.priority ?? 0,
+          added: obj.added ?? 0,
         });
       }
-      // Steam returns 100 per page; if fewer returned, we're on the last page
       if (entries.length < 100) break;
       page++;
       await new Promise((r) => setTimeout(r, 500));
@@ -530,6 +551,11 @@ export async function getBulkAppDetails(
 
 // ─── Additional image URL helpers ─────────────────────────────────────────────
 
+/** Workshop item URL on Steam Community. */
+export function getWorkshopItemUrl(publishedfileid: string): string {
+  return `https://steamcommunity.com/sharedfiles/filedetails/?id=${publishedfileid}`;
+}
+
 /** Portrait capsule used in Steam Library grid view (600×900). */
 export function getGamePortraitImageUrl(appId: number): string {
   return `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/library_600x900_2x.jpg`;
@@ -565,54 +591,72 @@ export interface InventoryItem {
  * Returns up to 5000 items. Returns empty array if private or unavailable.
  */
 export async function getInventoryItems(steamId: string): Promise<InventoryItem[]> {
+  const allItems: InventoryItem[] = [];
+  let lastAssetId: string | undefined;
+
   try {
-    const url = `https://steamcommunity.com/inventory/${steamId}/753/6?l=french&count=5000`;
-    const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) return [];
-
-    const data = (await res.json()) as {
-      assets?: Array<{ assetid: string; classid: string; instanceid: string }>;
-      descriptions?: Array<{
-        classid: string;
-        instanceid: string;
-        name: string;
-        market_name: string;
-        type: string;
-        icon_url: string;
-        tradable: number;
-        marketable: number;
-        commodity: number;
-        tags?: InventoryTag[];
-      }>;
-      more_items?: number;
-    };
-
-    if (!data.assets?.length || !data.descriptions?.length) return [];
-
-    // Build lookup: "classid_instanceid" → description
-    const descMap = new Map(
-      data.descriptions.map((d) => [`${d.classid}_${d.instanceid}`, d])
-    );
-
-    const items: InventoryItem[] = [];
-    for (const asset of data.assets) {
-      const desc = descMap.get(`${asset.classid}_${asset.instanceid}`);
-      if (!desc) continue;
-      items.push({
-        assetid: asset.assetid,
-        classid: asset.classid,
-        name: desc.name,
-        market_name: desc.market_name,
-        type: desc.type,
-        icon_url: `https://cdn.cloudflare.steamstatic.com/economy/image/${desc.icon_url}/96fx96f`,
-        tradable: desc.tradable === 1,
-        marketable: desc.marketable === 1,
-        commodity: desc.commodity === 1,
-        tags: desc.tags,
+    while (true) {
+      const params = new URLSearchParams({ l: "english", count: "5000" });
+      if (lastAssetId) params.set("start_assetid", lastAssetId);
+      const url = `https://steamcommunity.com/inventory/${steamId}/753/6?${params.toString()}`;
+      const res = await fetch(url, {
+        cache: "no-store",
+        headers: { "User-Agent": "SteamTrackerNotion/1.0" },
       });
+      if (!res.ok) break;
+
+      const data = (await res.json()) as {
+        success?: number | boolean;
+        assets?: Array<{ assetid: string; classid: string; instanceid: string }>;
+        descriptions?: Array<{
+          classid: string;
+          instanceid: string;
+          name: string;
+          market_name: string;
+          type: string;
+          icon_url: string;
+          tradable: number;
+          marketable: number;
+          commodity: number;
+          tags?: InventoryTag[];
+        }>;
+        more_items?: number;
+        last_assetid?: string;
+        total_inventory_count?: number;
+      };
+
+      // success can be 1, true, or absent; false/0 means private or error
+      if (data.success === false || data.success === 0) break;
+      if (!data.assets?.length || !data.descriptions?.length) break;
+
+      // Build lookup: "classid_instanceid" → description
+      const descMap = new Map(
+        data.descriptions.map((d) => [`${d.classid}_${d.instanceid}`, d])
+      );
+
+      for (const asset of data.assets) {
+        const desc = descMap.get(`${asset.classid}_${asset.instanceid}`);
+        if (!desc) continue;
+        allItems.push({
+          assetid: asset.assetid,
+          classid: asset.classid,
+          name: desc.name,
+          market_name: desc.market_name,
+          type: desc.type,
+          icon_url: `https://cdn.cloudflare.steamstatic.com/economy/image/${desc.icon_url}/96fx96f`,
+          tradable: desc.tradable === 1,
+          marketable: desc.marketable === 1,
+          commodity: desc.commodity === 1,
+          tags: desc.tags,
+        });
+      }
+
+      if (!data.more_items || !data.last_assetid) break;
+      lastAssetId = data.last_assetid;
+      await new Promise((r) => setTimeout(r, 1000));
     }
-    return items;
   } catch {
-    return [];
+    return allItems;
   }
+  return allItems;
 }

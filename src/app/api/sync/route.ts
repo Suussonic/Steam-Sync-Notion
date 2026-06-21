@@ -47,6 +47,7 @@ export async function POST(_request: NextRequest) {
           existingFriendsDbId: session.notionFriendsDbId,
           existingBadgesDbId: session.notionBadgesDbId,
           existingInventoryDbId: session.notionInventoryDbId,
+          existingWorkshopDbId: session.notionWorkshopDbId,
           onProgress: (message) => send({ type: "progress", message }),
         });
 
@@ -61,6 +62,7 @@ export async function POST(_request: NextRequest) {
             friendsDbId: result.friendsDbId,
             badgesDbId: result.badgesDbId,
             inventoryDbId: result.inventoryDbId,
+            workshopDbId: result.workshopDbId,
             profilePageId: result.profilePageId,
             gamesCount: result.gamesCount,
             achievementsCount: result.achievementsCount,
@@ -68,6 +70,7 @@ export async function POST(_request: NextRequest) {
             friendsCount: result.friendsCount,
             badgesCount: result.badgesCount,
             inventoryCount: result.inventoryCount,
+            workshopCount: result.workshopCount,
           });
         } else {
           send({ type: "error", message: result.error ?? "Erreur inconnue" });
@@ -112,6 +115,7 @@ export async function PATCH(request: NextRequest) {
     friendsDbId,
     badgesDbId,
     inventoryDbId,
+    workshopDbId,
     profilePageId,
     gamesCount,
     achievementsCount,
@@ -124,6 +128,7 @@ export async function PATCH(request: NextRequest) {
     friendsDbId?: string;
     badgesDbId?: string;
     inventoryDbId?: string;
+    workshopDbId?: string;
     profilePageId?: string;
     gamesCount?: number;
     achievementsCount?: number;
@@ -137,6 +142,7 @@ export async function PATCH(request: NextRequest) {
   if (friendsDbId) session.notionFriendsDbId = friendsDbId;
   if (badgesDbId) session.notionBadgesDbId = badgesDbId;
   if (inventoryDbId) session.notionInventoryDbId = inventoryDbId;
+  if (workshopDbId) session.notionWorkshopDbId = workshopDbId;
   if (profilePageId) session.notionProfilePageId = profilePageId;
   session.lastSyncAt = new Date().toISOString();
   if (gamesCount !== undefined && achievementsCount !== undefined) {

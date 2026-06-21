@@ -24,6 +24,7 @@ export interface SessionData {
   notionFriendsDbId?: string;
   notionBadgesDbId?: string;
   notionInventoryDbId?: string;
+  notionWorkshopDbId?: string;
   lastSyncAt?: string;
   lastSyncStats?: { games: number; achievements: number };
 }

@@ -30,6 +30,7 @@ import {
   getFriendList,
   getWishlist,
   getWorkshopItems,
+  getWorkshopItemUrl,
   getInventoryItems,
   getPlayerSummaries,
   getPersonaStateLabel,
@@ -47,6 +48,7 @@ import {
   type SteamFriend,
   type WishlistItem,
   type InventoryItem,
+  type WorkshopItem,
   type SteamPlayerSummary,
 } from "@/lib/steam/api";
 
@@ -67,6 +69,7 @@ export interface SyncOptions {
   existingFriendsDbId?: string;
   existingBadgesDbId?: string;
   existingInventoryDbId?: string;
+  existingWorkshopDbId?: string;
   onProgress?: (message: string) => void;
 }
 
@@ -80,6 +83,7 @@ export interface SyncResult {
   friendsDbId?: string;
   badgesDbId?: string;
   inventoryDbId?: string;
+  workshopDbId?: string;
   profilePageId?: string;
   gamesCount?: number;
   achievementsCount?: number;
@@ -87,6 +91,7 @@ export interface SyncResult {
   friendsCount?: number;
   badgesCount?: number;
   inventoryCount?: number;
+  workshopCount?: number;
   error?: string;
 }
 
@@ -107,6 +112,7 @@ export async function syncSteamToNotion(
     existingFriendsDbId,
     existingBadgesDbId,
     existingInventoryDbId,
+    existingWorkshopDbId,
     onProgress,
   } = options;
 
@@ -173,7 +179,7 @@ export async function syncSteamToNotion(
     report("Préparation de la structure Notion...");
     const mainPage = await findOrCreateMainPage(notion, existingPageId);
 
-    const [libraryDbId, achievementsDbId, wishlistDbId, friendsDbId, badgesDbId, inventoryDbId] =
+    const [libraryDbId, achievementsDbId, wishlistDbId, friendsDbId, badgesDbId, inventoryDbId, workshopDbId] =
       await Promise.all([
         findOrCreateDatabase(
           notion,
@@ -216,6 +222,13 @@ export async function syncSteamToNotion(
           existingInventoryDbId,
           "Inventaire Steam",
           buildInventoryDbSchema()
+        ),
+        findOrCreateDatabase(
+          notion,
+          mainPage.id,
+          existingWorkshopDbId,
+          "Workshop Steam",
+          buildWorkshopDbSchema()
         ),
       ]);
 
@@ -296,7 +309,19 @@ export async function syncSteamToNotion(
       );
     }
 
-    // ── Step 12: Profile page ──────────────────────────────────────────────
+    // ── Step 12: Sync workshop ─────────────────────────────────────────────
+    let workshopSyncCount = 0;
+    if (workshopItems.length > 0) {
+      report(`Synchronisation du Workshop (${workshopItems.length} éléments)...`);
+      workshopSyncCount = await syncWorkshop(
+        notion,
+        workshopDbId,
+        workshopItems,
+        (msg) => report(msg)
+      );
+    }
+
+    // ── Step 13: Profile page ──────────────────────────────────────────────
     report("Mise à jour du profil...");
     const profilePageId = await findOrCreateProfilePage(
       notion,
@@ -316,7 +341,7 @@ export async function syncSteamToNotion(
     });
 
     report(
-      `Terminé ! ${gamesCount} jeux · ${achievementsCount} succès · ${wishlistCount} souhaits · ${friendsCount} amis · ${badgesCount} badges · ${inventoryCount} objets`
+      `Terminé ! ${gamesCount} jeux · ${achievementsCount} succès · ${wishlistCount} souhaits · ${friendsCount} amis · ${badgesCount} badges · ${inventoryCount} objets · ${workshopSyncCount} workshop`
     );
 
     return {
@@ -329,6 +354,7 @@ export async function syncSteamToNotion(
       friendsDbId,
       badgesDbId,
       inventoryDbId,
+      workshopDbId,
       profilePageId,
       gamesCount,
       achievementsCount,
@@ -336,6 +362,7 @@ export async function syncSteamToNotion(
       friendsCount,
       badgesCount,
       inventoryCount,
+      workshopCount: workshopSyncCount,
     };
   } catch (err) {
     const message =
@@ -578,6 +605,8 @@ function buildWishlistDbSchema() {
     Développeur: { rich_text: {} },
     Gratuit: { checkbox: {} },
     "Prix (€)": { number: { format: "number" } },
+    "Prix initial (€)": { number: { format: "number" } },
+    "Remise (%)": { number: { format: "number" } },
     Metacritic: { number: { format: "number" } },
     Priorité: { number: { format: "number" } },
     "Date d'ajout": { date: {} },
@@ -647,6 +676,22 @@ function buildInventoryDbSchema() {
     "Image (URL)": { url: {} },
     Échangeable: { checkbox: {} },
     Vendable: { checkbox: {} },
+  };
+}
+
+function buildWorkshopDbSchema() {
+  return {
+    Titre: { title: {} },
+    "File ID": { rich_text: {} },
+    "App ID": { number: { format: "number" } },
+    "URL Workshop": { url: {} },
+    "Preview (URL)": { url: {} },
+    Abonnements: { number: { format: "number" } },
+    Favoris: { number: { format: "number" } },
+    Vues: { number: { format: "number" } },
+    Tags: { multi_select: { options: [] } },
+    "Créé le": { date: {} },
+    "Mis à jour le": { date: {} },
   };
 }
 
@@ -763,7 +808,7 @@ async function syncGames(
         await notionRetry(() =>
           notion.blocks.children.append({
             block_id: existingEntry.pageId,
-            children: buildGameImageBlocks(game.appid) as BlockObjectRequest[],
+            children: buildGameImageBlocks(game.appid, storeDetails) as BlockObjectRequest[],
           })
         );
         await notionRetry(() =>
@@ -783,7 +828,7 @@ async function syncGames(
             : {}),
           properties: { ...properties, Galerie: { checkbox: true } },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          children: buildGameImageBlocks(game.appid) as any,
+          children: buildGameImageBlocks(game.appid, storeDetails) as any,
         })
       );
     }
@@ -796,8 +841,8 @@ async function syncGames(
   return synced;
 }
 
-function buildGameImageBlocks(appId: number): BlockObjectRequest[] {
-  return [
+function buildGameImageBlocks(appId: number, store?: AppDetails): BlockObjectRequest[] {
+  const blocks: BlockObjectRequest[] = [
     {
       type: "heading_3",
       heading_3: {
@@ -820,21 +865,19 @@ function buildGameImageBlocks(appId: number): BlockObjectRequest[] {
         external: { url: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/capsule_616x353.jpg` },
       },
     },
-    {
-      type: "image",
-      image: {
-        type: "external",
-        external: { url: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/library_600x900_2x.jpg` },
-      },
-    },
-    {
-      type: "image",
-      image: {
-        type: "external",
-        external: { url: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/library_hero.jpg` },
-      },
-    },
   ];
+
+  // Use screenshots from Store API (guaranteed to exist) — up to 4
+  if (store?.screenshots?.length) {
+    for (const ss of store.screenshots.slice(0, 4)) {
+      blocks.push({
+        type: "image",
+        image: { type: "external", external: { url: ss.path_full } },
+      });
+    }
+  }
+
+  return blocks;
 }
 
 function buildGameProperties(
@@ -1479,7 +1522,14 @@ async function syncWishlist(
       }
       properties["Gratuit"] = { checkbox: store.is_free };
       if (!store.is_free && store.price_overview) {
-        properties["Prix (€)"] = { number: store.price_overview.final / 100 };
+        const po = store.price_overview;
+        // Current (discounted) price
+        properties["Prix (€)"] = { number: po.final / 100 };
+        // Original price (only differs when there's a discount)
+        if (po.discount_percent > 0) {
+          properties["Prix initial (€)"] = { number: po.initial / 100 };
+          properties["Remise (%)"] = { number: po.discount_percent };
+        }
       }
       if (store.metacritic?.score) {
         properties["Metacritic"] = { number: store.metacritic.score };
@@ -1487,6 +1537,7 @@ async function syncWishlist(
     }
 
     const coverUrl = getGameHeroImageUrl(item.appid);
+    const iconUrl = getGameHeaderImageUrl(item.appid);
     const existingPageId = existingByAppId.get(item.appid);
     if (existingPageId) {
       await notionRetry(() =>
@@ -1494,6 +1545,7 @@ async function syncWishlist(
           page_id: existingPageId,
           properties,
           cover: { type: "external", external: { url: coverUrl } },
+          icon: { type: "external", external: { url: iconUrl } },
         })
       );
     } else {
@@ -1501,6 +1553,7 @@ async function syncWishlist(
         notion.pages.create({
           parent: { database_id: dbId },
           cover: { type: "external", external: { url: coverUrl } },
+          icon: { type: "external", external: { url: iconUrl } },
           properties,
         })
       );
@@ -1641,9 +1694,11 @@ async function syncBadges(
         : null;
 
     // Construct badge image URL
+    // For game badges: communityitemid is an item class ID, not an image hash.
+    // Use the game header image as a reliable fallback cover.
     let imageUrl: string | null = null;
-    if (isGameBadge && badge.communityitemid) {
-      imageUrl = `https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/items/${badge.appid}/${badge.communityitemid}.png`;
+    if (isGameBadge && badge.appid) {
+      imageUrl = getGameHeaderImageUrl(badge.appid);
     } else if (!isGameBadge) {
       imageUrl = `https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/badges/${badge.badgeid}_${badge.level}.png`;
     }
@@ -1780,6 +1835,84 @@ async function syncInventory(
 
   onProgress(`${synced} types d'objets synchronisés (${items.length} total).`);
   return items.length;
+}
+
+async function syncWorkshop(
+  notion: Client,
+  dbId: string,
+  items: WorkshopItem[],
+  onProgress: (msg: string) => void
+): Promise<number> {
+  if (items.length === 0) return 0;
+
+  const existing = await fetchAllDatabasePages(notion, dbId);
+  const existingByFileId = new Map<string, string>();
+  for (const page of existing) {
+    const fidProp = page.properties["File ID"];
+    if (fidProp?.type === "rich_text") {
+      const fid = fidProp.rich_text.map((t: { plain_text: string }) => t.plain_text).join("");
+      if (fid) existingByFileId.set(fid, page.id);
+    }
+  }
+
+  let synced = 0;
+  await batchProcess(items, 5, 1000, async (item) => {
+    const workshopUrl = getWorkshopItemUrl(item.publishedfileid);
+    const appId = item.consumer_appid || item.creator_appid;
+    const createdDate = item.time_created
+      ? new Date(item.time_created * 1000).toISOString().split("T")[0]
+      : null;
+    const updatedDate = item.time_updated
+      ? new Date(item.time_updated * 1000).toISOString().split("T")[0]
+      : null;
+    const coverUrl = item.preview_url ?? getGameHeaderImageUrl(appId);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const properties: Record<string, any> = {
+      Titre: { title: [{ text: { content: item.title.slice(0, 2000) } }] },
+      "File ID": { rich_text: [{ text: { content: item.publishedfileid } }] },
+      "App ID": { number: appId },
+      "URL Workshop": { url: workshopUrl },
+      ...(item.preview_url ? { "Preview (URL)": { url: item.preview_url } } : {}),
+      ...(item.subscriptions != null ? { Abonnements: { number: item.subscriptions } } : {}),
+      ...(item.favorited != null ? { Favoris: { number: item.favorited } } : {}),
+      ...(item.views != null ? { Vues: { number: item.views } } : {}),
+      ...(item.tags?.length
+        ? {
+            Tags: {
+              multi_select: item.tags.map((t) => ({
+                name: (t.display_name ?? t.tag).slice(0, 100),
+              })),
+            },
+          }
+        : {}),
+      ...(createdDate ? { "Créé le": { date: { start: createdDate } } } : {}),
+      ...(updatedDate ? { "Mis à jour le": { date: { start: updatedDate } } } : {}),
+    };
+
+    const existingPageId = existingByFileId.get(item.publishedfileid);
+    if (existingPageId) {
+      await notionRetry(() =>
+        notion.pages.update({
+          page_id: existingPageId,
+          properties,
+          cover: { type: "external", external: { url: coverUrl } },
+        })
+      );
+    } else {
+      await notionRetry(() =>
+        notion.pages.create({
+          parent: { database_id: dbId },
+          cover: { type: "external", external: { url: coverUrl } },
+          properties,
+        })
+      );
+    }
+    synced++;
+  });
+
+  onProgress(`${synced} éléments Workshop synchronisés.`);
+  return synced;
 }
 
 // ─── Schema migration ─────────────────────────────────────────────────────────
