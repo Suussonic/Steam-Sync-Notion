@@ -39,6 +39,9 @@ import {
   getGameCapsuleImageUrl,
   getStorePage,
   getGameIconUrl,
+  getBadgeAssetInfoBatch,
+  getBadgeIconCdnUrl,
+  getTradingCardsForApp,
   minutesToHours,
   type OwnedGame,
   type RecentlyPlayedGame,
@@ -50,6 +53,8 @@ import {
   type InventoryItem,
   type WorkshopItem,
   type SteamPlayerSummary,
+  type BadgeAssetInfo,
+  type TradingCard,
 } from "@/lib/steam/api";
 
 import type { SteamProfile } from "@/lib/steam/openid";
@@ -284,15 +289,22 @@ export async function syncSteamToNotion(
     let badgesCount = 0;
     if (playerBadges && playerBadges.badges.length > 0) {
       report(`Synchronisation des badges (${playerBadges.badges.length})...`);
-      // Build appId → game name map for badge labeling
+      // Build appId → game name and icon maps for badge labeling
       const gameNameMap = new Map<number, string>([
         ...ownedGames.map((g): [number, string] => [g.appid, g.name]),
       ]);
+      const gameIconMap = new Map<number, string>(
+        ownedGames
+          .filter((g) => !!g.img_icon_url)
+          .map((g) => [g.appid, g.img_icon_url])
+      );
       badgesCount = await syncBadges(
         notion,
         badgesDbId,
         playerBadges.badges,
         gameNameMap,
+        gameIconMap,
+        inventoryItems,
         (msg) => report(msg)
       );
     }
@@ -651,6 +663,18 @@ function buildBadgesDbSchema() {
     "Rareté": { number: { format: "number" } },
     "Image (URL)": { url: {} },
     Date: { date: {} },
+    "Débloqué": { checkbox: {} },
+    Foil: { checkbox: {} },
+    "Cartes ajoutées": { checkbox: {} },
+    Type: {
+      select: {
+        options: [
+          { name: "Jeu", color: "blue" },
+          { name: "Système", color: "gray" },
+          { name: "Événement", color: "purple" },
+        ],
+      },
+    },
   };
 }
 
@@ -701,7 +725,8 @@ interface AchievementEntry {
   apiname: string;
   displayName: string;
   description: string;
-  icon: string;
+  icon: string;       // colored (unlocked) icon URL
+  icongray: string;  // gray (locked) icon URL
   achieved: boolean;
   unlocktime: number;
   globalPct: number;
@@ -734,6 +759,7 @@ async function fetchAchievementsForGames(
       displayName: schema[a.apiname]?.displayName ?? a.apiname,
       description: schema[a.apiname]?.description ?? "",
       icon: schema[a.apiname]?.icon ?? "",
+      icongray: schema[a.apiname]?.icongray ?? "",
       achieved: a.achieved === 1,
       unlocktime: a.unlocktime,
       globalPct: Math.round((globalPct[a.apiname] ?? 0) * 10) / 10,
@@ -1091,11 +1117,16 @@ async function syncAchievements(
         ? new Date(entry.unlocktime * 1000).toISOString().split("T")[0]
         : null;
 
+    // Use colored icon for unlocked achievements, gray icon for locked ones
+    const pageIconUrl = entry.achieved
+      ? (entry.icon || entry.icongray || null)
+      : (entry.icongray || entry.icon || null);
+
     await notionRetry(() =>
       notion.pages.create({
         parent: { database_id: dbId },
-        ...(entry.icon
-          ? { icon: { type: "external", external: { url: entry.icon } } }
+        ...(pageIconUrl
+          ? { icon: { type: "external", external: { url: pageIconUrl } } }
           : {}),
         properties: {
           Succès: { title: [{ text: { content: entry.displayName } }] },
@@ -1665,43 +1696,131 @@ async function syncBadges(
   dbId: string,
   badges: PlayerBadge[],
   gameNameMap: Map<number, string>,
+  gameIconMap: Map<number, string>,
+  inventoryItems: InventoryItem[],
   onProgress: (msg: string) => void
 ): Promise<number> {
+  // ── 1. Badge asset info (real names + icons) from Steam Economy API ─────
+  const idsWithItems = badges
+    .map((b) => b.communityitemid)
+    .filter((id): id is string => !!id);
+
+  onProgress(`Récupération des icônes Steam pour ${idsWithItems.length} badges...`);
+  const assetInfoMap: Map<string, BadgeAssetInfo> =
+    idsWithItems.length > 0
+      ? await getBadgeAssetInfoBatch(idsWithItems)
+      : new Map();
+
+  // ── 2. Trading cards for all game badges (parallel batches) ────────────
+  const gameAppIds = [
+    ...new Set(badges.filter((b) => (b.appid ?? 0) > 0).map((b) => b.appid!)),
+  ];
+  const cardsByAppId = new Map<number, TradingCard[]>();
+  if (gameAppIds.length > 0) {
+    onProgress(`Récupération des cartes pour ${gameAppIds.length} jeux...`);
+    const CARD_BATCH = 5;
+    for (let i = 0; i < gameAppIds.length; i += CARD_BATCH) {
+      const batch = gameAppIds.slice(i, i + CARD_BATCH);
+      const results = await Promise.all(
+        batch.map((appId) => getTradingCardsForApp(appId))
+      );
+      batch.forEach((appId, idx) => {
+        if (results[idx].length > 0) cardsByAppId.set(appId, results[idx]);
+      });
+      if (i + CARD_BATCH < gameAppIds.length) await sleep(1200);
+    }
+    onProgress(`Cartes récupérées pour ${cardsByAppId.size} jeux.`);
+  }
+
+  // ── 3. Owned cards from user's inventory, keyed by appId ───────────────
+  // Trading cards have item_class_2 tag and a Game_{appid} tag.
+  const ownedCardsByAppId = new Map<number, Set<string>>();
+  for (const item of inventoryItems) {
+    const gameTag = item.tags?.find((t) => t.category === "Game");
+    const classTag = item.tags?.find(
+      (t) => t.category === "item_class" && t.internal_name === "item_class_2"
+    );
+    if (!gameTag || !classTag) continue;
+    const match = gameTag.internal_name.match(/^Game_(\d+)$/);
+    if (!match) continue;
+    const appId = parseInt(match[1], 10);
+    if (!ownedCardsByAppId.has(appId)) ownedCardsByAppId.set(appId, new Set());
+    ownedCardsByAppId.get(appId)!.add(item.market_name);
+  }
+
+  // ── 4. Fetch existing badge pages ─────────────────────────────────────
   const existing = await fetchAllDatabasePages(notion, dbId);
-  // Key: "badgeid:level" → pageId
-  const existingByKey = new Map<string, string>();
+  // Key: "badgeid:level" → { pageId, hasCards }
+  const existingByKey = new Map<string, { pageId: string; hasCards: boolean }>();
   for (const page of existing) {
     const idProp = page.properties["Badge ID"];
     const lvlProp = page.properties["Niveau"];
+    const hasCardsProp = page.properties["Cartes ajoutées"];
     const id = idProp?.type === "number" ? (idProp.number ?? 0) : 0;
     const lvl = lvlProp?.type === "number" ? (lvlProp.number ?? 0) : 0;
-    existingByKey.set(`${id}:${lvl}`, page.id);
+    const hasCards =
+      hasCardsProp?.type === "checkbox" ? hasCardsProp.checkbox : false;
+    existingByKey.set(`${id}:${lvl}`, { pageId: page.id, hasCards });
   }
 
+  // ── 5. Sync each badge ───────────────────────────────────────────────
   let synced = 0;
   await batchProcess(badges, 5, 1000, async (badge) => {
     const isGameBadge = (badge.appid ?? 0) > 0;
-    const gameName = isGameBadge
-      ? (gameNameMap.get(badge.appid!) ?? `App ${badge.appid}`)
-      : null;
-    const badgeName = gameName
-      ? `${gameName} — Cartes`
-      : `Badge système #${badge.badgeid}`;
+    const assetInfo = badge.communityitemid
+      ? assetInfoMap.get(badge.communityitemid)
+      : undefined;
+
+    // Badge name: prefer real name from Steam Economy API
+    let badgeName: string;
+    if (assetInfo?.name) {
+      badgeName = assetInfo.name;
+    } else if (isGameBadge && badge.appid) {
+      const gameName = gameNameMap.get(badge.appid) ?? `App ${badge.appid}`;
+      badgeName = `${gameName} — Badge niveau ${badge.level}`;
+    } else {
+      badgeName = `Badge #${badge.badgeid} (Niveau ${badge.level})`;
+    }
+
+    const badgeType = isGameBadge ? "Jeu" : "Système";
+    const isFoil = (badge.border_color ?? 0) > 0;
+
+    // Badge icon: Economy CDN URL from asset info, fallback to game icon or system badge CDN
+    let imageUrl: string | null = null;
+    const iconHash = assetInfo?.icon_url || assetInfo?.icon_url_large;
+    if (iconHash) {
+      imageUrl = getBadgeIconCdnUrl(iconHash);
+    } else if (isGameBadge && badge.appid) {
+      // Fallback: use the game's small icon as the badge page icon
+      const gameImgHash = gameIconMap.get(badge.appid);
+      if (gameImgHash) {
+        imageUrl = getGameIconUrl(badge.appid, gameImgHash);
+      }
+    } else if (!isGameBadge) {
+      imageUrl = `https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/badges/${badge.badgeid}/${badge.level}.png`;
+    }
+
+    // Cover: game banner for game badges, badge icon for system badges
+    const coverUrl =
+      isGameBadge && badge.appid
+        ? getGameHeaderImageUrl(badge.appid)
+        : (imageUrl ?? null);
 
     const completionDate =
       badge.completion_time > 0
         ? new Date(badge.completion_time * 1000).toISOString().split("T")[0]
         : null;
 
-    // Construct badge image URL
-    // For game badges: communityitemid is an item class ID, not an image hash.
-    // Use the game header image as a reliable fallback cover.
-    let imageUrl: string | null = null;
-    if (isGameBadge && badge.appid) {
-      imageUrl = getGameHeaderImageUrl(badge.appid);
-    } else if (!isGameBadge) {
-      imageUrl = `https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/badges/${badge.badgeid}_${badge.level}.png`;
-    }
+    // Trading cards for this badge
+    const allCards =
+      isGameBadge && badge.appid
+        ? (cardsByAppId.get(badge.appid) ?? [])
+        : [];
+    const ownedCardNames =
+      isGameBadge && badge.appid
+        ? (ownedCardsByAppId.get(badge.appid) ?? new Set<string>())
+        : new Set<string>();
+    const hasCardsData = allCards.length > 0;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const properties: Record<string, any> = {
@@ -1710,6 +1829,9 @@ async function syncBadges(
       Niveau: { number: badge.level },
       XP: { number: badge.xp },
       "Rareté": { number: badge.scarcity },
+      "Débloqué": { checkbox: true }, // GetBadges only returns earned badges
+      Foil: { checkbox: isFoil },
+      Type: { select: { name: badgeType } },
       ...(isGameBadge && badge.appid
         ? {
             "App ID": { number: badge.appid },
@@ -1721,25 +1843,61 @@ async function syncBadges(
     };
 
     const key = `${badge.badgeid}:${badge.level}`;
-    const existingPageId = existingByKey.get(key);
-    if (existingPageId) {
+    const existingEntry = existingByKey.get(key);
+    const needsCards = hasCardsData && !(existingEntry?.hasCards ?? false);
+
+    if (existingEntry) {
+      // Update properties + cover + icon
       await notionRetry(() =>
         notion.pages.update({
-          page_id: existingPageId,
-          properties,
+          page_id: existingEntry.pageId,
+          properties: {
+            ...properties,
+            ...(needsCards ? { "Cartes ajoutées": { checkbox: true } } : {}),
+          },
+          ...(coverUrl
+            ? { cover: { type: "external", external: { url: coverUrl } } }
+            : {}),
           ...(imageUrl
-            ? { cover: { type: "external", external: { url: imageUrl } } }
+            ? { icon: { type: "external", external: { url: imageUrl } } }
             : {}),
         })
       );
+      // Append card blocks if not already there
+      if (needsCards) {
+        const cardBlocks = buildBadgeCardBlocks(
+          allCards,
+          ownedCardNames
+        ) as BlockObjectRequest[];
+        for (let i = 0; i < cardBlocks.length; i += 100) {
+          await notionRetry(() =>
+            notion.blocks.children.append({
+              block_id: existingEntry.pageId,
+              children: cardBlocks.slice(i, i + 100),
+            })
+          );
+        }
+      }
     } else {
+      // Create new badge page, embed card blocks directly
+      const cardBlocks = hasCardsData
+        ? (buildBadgeCardBlocks(allCards, ownedCardNames) as BlockObjectRequest[])
+        : [];
       await notionRetry(() =>
         notion.pages.create({
           parent: { database_id: dbId },
-          ...(imageUrl
-            ? { cover: { type: "external", external: { url: imageUrl } } }
+          ...(coverUrl
+            ? { cover: { type: "external", external: { url: coverUrl } } }
             : {}),
-          properties,
+          ...(imageUrl
+            ? { icon: { type: "external", external: { url: imageUrl } } }
+            : {}),
+          properties: {
+            ...properties,
+            "Cartes ajoutées": { checkbox: hasCardsData },
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          children: cardBlocks as any,
         })
       );
     }
@@ -1748,6 +1906,63 @@ async function syncBadges(
 
   onProgress(`${synced} badges synchronisés.`);
   return synced;
+}
+
+/**
+ * Build Notion blocks for the trading cards section inside a badge page.
+ * Shows each card's image with a caption indicating owned (✅) or missing (❌).
+ */
+function buildBadgeCardBlocks(
+  cards: TradingCard[],
+  ownedNames: Set<string>
+): BlockObjectRequest[] {
+  const ownedCount = cards.filter((c) => ownedNames.has(c.name)).length;
+
+  const blocks: BlockObjectRequest[] = [
+    {
+      type: "heading_3",
+      heading_3: {
+        rich_text: [
+          {
+            type: "text",
+            text: {
+              content: `Cartes — ${ownedCount}/${cards.length} possédées`,
+            },
+          },
+        ],
+        color: "default",
+        is_toggleable: false,
+      },
+    },
+  ];
+
+  for (const card of cards) {
+    const isOwned = ownedNames.has(card.name);
+    const cardImageUrl = `https://cdn.cloudflare.steamstatic.com/economy/image/${card.icon_url}`;
+    blocks.push({
+      type: "image",
+      image: {
+        type: "external",
+        external: { url: cardImageUrl },
+        caption: [
+          {
+            type: "text",
+            text: { content: `${isOwned ? "✅" : "❌"} ${card.name}` },
+            annotations: {
+              bold: isOwned,
+              italic: false,
+              strikethrough: false,
+              underline: false,
+              code: false,
+              color: isOwned ? "green" : "red",
+            },
+          },
+        ],
+      },
+    });
+  }
+
+  return blocks;
 }
 
 // ─── Inventory sync ───────────────────────────────────────────────────────────

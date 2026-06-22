@@ -363,6 +363,90 @@ export async function getPlayerBadges(
   return data?.response ?? null;
 }
 
+// ─── Badge asset info (Steam Economy API) ────────────────────────────────────
+
+export interface BadgeAssetInfo {
+  classid: string;
+  name?: string;
+  /** Hash — combine with getBadgeIconCdnUrl() to get full URL. */
+  icon_url?: string;
+  icon_url_large?: string;
+  type?: string;
+  tradable?: boolean;
+  marketable?: boolean;
+}
+
+/** Convert a Steam Economy icon_url hash to a full CDN URL (96×96). */
+export function getBadgeIconCdnUrl(iconUrlHash: string): string {
+  return `https://cdn.cloudflare.steamstatic.com/economy/image/${iconUrlHash}/96fx96f`;
+}
+
+/**
+ * Fetch Steam Economy asset class info for a list of badge communityitemids.
+ * Uses appid=753 (Steam Community — trading cards, badges, emoticons, …).
+ * Returns a map of classid → BadgeAssetInfo.
+ */
+export async function getBadgeAssetInfoBatch(
+  communityItemIds: string[]
+): Promise<Map<string, BadgeAssetInfo>> {
+  const result = new Map<string, BadgeAssetInfo>();
+  if (communityItemIds.length === 0) return result;
+
+  const BATCH = 100;
+  for (let i = 0; i < communityItemIds.length; i += BATCH) {
+    const batch = communityItemIds.slice(i, i + BATCH);
+    try {
+      const url = new URL(`${STEAM_API_BASE}/ISteamEconomy/GetAssetClassInfo/v1/`);
+      url.searchParams.set("key", key());
+      url.searchParams.set("appid", "753");
+      url.searchParams.set("language", "english");
+      url.searchParams.set("class_count", batch.length.toString());
+      batch.forEach((id, idx) => {
+        url.searchParams.set(`classid${idx}`, id);
+        url.searchParams.set(`instanceid${idx}`, "0");
+      });
+
+      const res = await fetch(url.toString(), { cache: "no-store" });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          result?: Record<
+            string,
+            | {
+                name?: string;
+                icon_url?: string;
+                icon_url_large?: string;
+                type?: string;
+                tradable?: string;
+                marketable?: string;
+              }
+            | boolean
+          >;
+        };
+        if (data.result) {
+          for (const [classid, info] of Object.entries(data.result)) {
+            if (classid === "success" || typeof info === "boolean") continue;
+            result.set(classid, {
+              classid,
+              name: info.name,
+              icon_url: info.icon_url,
+              icon_url_large: info.icon_url_large,
+              type: info.type,
+              tradable: info.tradable === "1",
+              marketable: info.marketable === "1",
+            });
+          }
+        }
+      }
+    } catch {
+      // Non-critical
+    }
+    if (i + BATCH < communityItemIds.length) {
+      await new Promise((r) => setTimeout(r, 600));
+    }
+  }
+  return result;
+}
+
 // ─── Per-game user stats ──────────────────────────────────────────────────────
 
 export interface GameStatEntry {
@@ -547,6 +631,75 @@ export async function getBulkAppDetails(
     }
   }
   return result;
+}
+
+// ─── Trading cards ────────────────────────────────────────────────────────────
+
+export interface TradingCard {
+  classid: string;
+  /** Short display name, e.g. "Joe Musashi". */
+  name: string;
+  /** Economy image hash — use with: https://cdn.cloudflare.steamstatic.com/economy/image/{hash} */
+  icon_url: string;
+  market_hash_name: string;
+}
+
+/**
+ * Fetch all trading cards available for a game via the Steam Community Market.
+ * Uses the public market search render endpoint (no API key required).
+ * Returns an empty array if the game has no trading cards or the request fails.
+ */
+export async function getTradingCardsForApp(appId: number): Promise<TradingCard[]> {
+  try {
+    // category_753_Game[]=tag_app_{appId}  selects cards for this game
+    // category_753_item_class[]=tag_item_class_2  filters to Trading Cards only
+    const url =
+      `https://steamcommunity.com/market/search/render/` +
+      `?appid=753` +
+      `&category_753_Game%5B%5D=tag_app_${appId}` +
+      `&category_753_item_class%5B%5D=tag_item_class_2` +
+      `&count=100&format=json&l=english`;
+
+    const res = await fetch(url, {
+      cache: "no-store",
+      headers: { "User-Agent": "SteamTrackerNotion/1.0" },
+    });
+    if (!res.ok) return [];
+
+    const data = (await res.json()) as {
+      success: boolean;
+      results?: Array<{
+        name: string;
+        hash_name?: string;
+        asset_description?: {
+          classid: string;
+          icon_url: string;
+          name?: string;
+          market_name?: string;
+          market_hash_name?: string;
+        };
+      }>;
+    };
+
+    if (!data.success || !data.results?.length) return [];
+
+    return data.results
+      .filter((r) => r.asset_description?.classid && r.asset_description.icon_url)
+      .map((r) => ({
+        classid: r.asset_description!.classid,
+        name:
+          r.asset_description!.market_name ??
+          r.asset_description!.name ??
+          r.name,
+        icon_url: r.asset_description!.icon_url,
+        market_hash_name:
+          r.asset_description!.market_hash_name ??
+          r.hash_name ??
+          r.name,
+      }));
+  } catch {
+    return [];
+  }
 }
 
 // ─── Additional image URL helpers ─────────────────────────────────────────────
