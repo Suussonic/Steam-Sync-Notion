@@ -555,6 +555,33 @@ export async function getFriendList(steamId: string): Promise<SteamFriend[]> {
   return data?.friendslist?.friends ?? [];
 }
 
+// ─── Player groups ─────────────────────────────────────────────────────────────
+
+/**
+ * All Steam group IDs the user belongs to.
+ * Returns empty array if private or unavailable.
+ */
+export async function getPlayerGroups(steamId: string): Promise<string[]> {
+  const data = await steamFetch<{
+    response?: { groups?: Array<{ gid: string }> };
+  }>("ISteamUser/GetUserGroupList/v1/", { steamid: steamId });
+  return (data?.response?.groups ?? []).map((g) => g.gid);
+}
+
+// ─── Current player count ─────────────────────────────────────────────────────
+
+/**
+ * Current concurrent player count for a specific game.
+ * Does not require an API key.
+ * Returns 0 if unavailable.
+ */
+export async function getCurrentPlayerCount(appId: number): Promise<number> {
+  const data = await steamFetch<{
+    response?: { player_count?: number; result?: number };
+  }>("ISteamUserStats/GetNumberOfCurrentPlayers/v1/", { appid: appId.toString() }, false);
+  return data?.response?.player_count ?? 0;
+}
+
 // ─── Workshop ─────────────────────────────────────────────────────────────────
 
 export interface WorkshopItem {

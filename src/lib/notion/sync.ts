@@ -6,7 +6,14 @@
  *   🎮 Steam Sync Notion            ← main page
  *   ├── 👤 Profil Steam             ← page with stats blocks
  *   ├── 📚 Bibliothèque Steam       ← database: one row per owned game
- *   └── 🏆 Succès récents           ← database: unlocked achievements (recent games)
+ *   ├── 🏆 Succès                   ← database: achievements (recent games)
+ *   ├── 📋 Liste de souhaits        ← database: wishlist
+ *   ├── 👥 Amis                     ← database: friends list
+ *   ├── 🏅 Badges Steam             ← database: badges + trading cards
+ *   ├── 🎒 Inventaire Steam         ← database: community inventory items
+ *   ├── 🔧 Workshop Steam           ← database: published workshop items
+ *   ├── 👥 Groupes Steam            ← database: Steam groups membership
+ *   └── 📊 Statistiques             ← database: per-game in-game stats
  */
 
 import { Client } from "@notionhq/client";
@@ -43,6 +50,9 @@ import {
   getBadgeIconCdnUrl,
   getTradingCardsForApp,
   minutesToHours,
+  getPlayerGroups,
+  getCurrentPlayerCount,
+  getUserStatsForGame,
   type OwnedGame,
   type RecentlyPlayedGame,
   type AppDetails,
@@ -55,7 +65,16 @@ import {
   type SteamPlayerSummary,
   type BadgeAssetInfo,
   type TradingCard,
+  type GameStatEntry,
 } from "@/lib/steam/api";
+
+import {
+  hasSteamapisKey,
+  getBulkSteamapisAppDetails,
+  getSteamapisGroups,
+  getSteamapisStats,
+  type SteamapisAppDetails,
+} from "@/lib/steam/steamapis";
 
 import type { SteamProfile } from "@/lib/steam/openid";
 
@@ -75,6 +94,8 @@ export interface SyncOptions {
   existingBadgesDbId?: string;
   existingInventoryDbId?: string;
   existingWorkshopDbId?: string;
+  existingGroupsDbId?: string;
+  existingStatsDbId?: string;
   onProgress?: (message: string) => void;
 }
 
@@ -89,6 +110,8 @@ export interface SyncResult {
   badgesDbId?: string;
   inventoryDbId?: string;
   workshopDbId?: string;
+  groupsDbId?: string;
+  statsDbId?: string;
   profilePageId?: string;
   gamesCount?: number;
   achievementsCount?: number;
@@ -97,6 +120,8 @@ export interface SyncResult {
   badgesCount?: number;
   inventoryCount?: number;
   workshopCount?: number;
+  groupsCount?: number;
+  statsCount?: number;
   error?: string;
 }
 
@@ -118,6 +143,8 @@ export async function syncSteamToNotion(
     existingBadgesDbId,
     existingInventoryDbId,
     existingWorkshopDbId,
+    existingGroupsDbId,
+    existingStatsDbId,
     onProgress,
   } = options;
 
@@ -154,6 +181,26 @@ export async function syncSteamToNotion(
     const storeDetailsMap = await getBulkAppDetails(allAppIds);
     report(`Métadonnées récupérées pour ${storeDetailsMap.size} jeux.`);
 
+    // ── Step 2b: Enriched app details via steamapis.com (optional) ─────────
+    const steamapisDetailsMap = hasSteamapisKey()
+      ? await getBulkSteamapisAppDetails(recentGames.map((g) => g.appid))
+      : new Map<number, SteamapisAppDetails>();
+    if (hasSteamapisKey() && steamapisDetailsMap.size > 0) {
+      report(`Données enrichies steamapis.com pour ${steamapisDetailsMap.size} jeux.`);
+    }
+
+    // ── Step 2c: Current player counts for recently played games ──────────
+    const playerCountMap = new Map<number, number>();
+    if (recentGames.length > 0) {
+      report("Récupération du nombre de joueurs actuels...");
+      const counts = await Promise.all(
+        recentGames.map((g) => getCurrentPlayerCount(g.appid).catch(() => 0))
+      );
+      recentGames.forEach((g, i) => {
+        if (counts[i] > 0) playerCountMap.set(g.appid, counts[i]);
+      });
+    }
+
     // ── Step 3: Achievements for top 50 played games with stats ───────────
     const gamesWithStats = ownedGames
       .filter((g) => g.has_community_visible_stats && g.playtime_forever > 0)
@@ -167,14 +214,57 @@ export async function syncSteamToNotion(
       (msg) => report(msg)
     );
 
-    // ── Step 4: Badges, friends list, workshop, inventory (parallel) ──────
-    report("Récupération badges, amis, workshop, inventaire...");
-    const [playerBadges, rawFriends, workshopItems, inventoryItems] = await Promise.all([
-      getPlayerBadges(steamId),
-      getFriendList(steamId),
-      getWorkshopItems(steamId),
-      getInventoryItems(steamId),
-    ]);
+    // ── Step 4: Badges, friends, groups, workshop, inventory (parallel) ──
+    report("Récupération badges, amis, groupes, workshop, inventaire...");
+    const [playerBadges, rawFriends, workshopItems, inventoryItems, groups] =
+      await Promise.all([
+        getPlayerBadges(steamId),
+        getFriendList(steamId),
+        getWorkshopItems(steamId),
+        getInventoryItems(steamId),
+        hasSteamapisKey()
+          ? getSteamapisGroups(steamId)
+          : getPlayerGroups(steamId),
+      ]);
+
+    // ── Step 4b: In-game stats for recently played games ──────────────────
+    const statsData: Array<{
+      gameName: string;
+      appId: number;
+      stats: GameStatEntry[];
+    }> = [];
+    const recentWithStats = recentGames.filter(
+      (g) => g.has_community_visible_stats
+    );
+    if (recentWithStats.length > 0) {
+      report(
+        `Récupération des statistiques in-game pour ${recentWithStats.length} jeux...`
+      );
+      await batchProcess(
+        recentWithStats.slice(0, 20),
+        3,
+        600,
+        async (g) => {
+          try {
+            const data = await getUserStatsForGame(steamId, g.appid);
+            if (data?.stats && data.stats.length > 0) {
+              statsData.push({
+                gameName: data.gameName,
+                appId: g.appid,
+                stats: data.stats,
+              });
+            }
+          } catch {
+            // Non-critical — stats may be private or unavailable
+          }
+        }
+      );
+      if (statsData.length > 0) {
+        report(`Statistiques récupérées pour ${statsData.length} jeux.`);
+      }
+    }
+
+    if (groups.length > 0) report(`${groups.length} groupes Steam récupérés.`);
 
     // Enrich up to 200 friends with profile summaries
     const friends = await enrichFriends(rawFriends.slice(0, 200));
@@ -184,7 +274,7 @@ export async function syncSteamToNotion(
     report("Préparation de la structure Notion...");
     const mainPage = await findOrCreateMainPage(notion, existingPageId);
 
-    const [libraryDbId, achievementsDbId, wishlistDbId, friendsDbId, badgesDbId, inventoryDbId, workshopDbId] =
+    const [libraryDbId, achievementsDbId, wishlistDbId, friendsDbId, badgesDbId, inventoryDbId, workshopDbId, groupsDbId, statsDbId] =
       await Promise.all([
         findOrCreateDatabase(
           notion,
@@ -235,6 +325,20 @@ export async function syncSteamToNotion(
           "Workshop Steam",
           buildWorkshopDbSchema()
         ),
+        findOrCreateDatabase(
+          notion,
+          mainPage.id,
+          existingGroupsDbId,
+          "Groupes Steam",
+          buildGroupsDbSchema()
+        ),
+        findOrCreateDatabase(
+          notion,
+          mainPage.id,
+          existingStatsDbId,
+          "Statistiques",
+          buildStatsDbSchema()
+        ),
       ]);
 
     // ── Step 6: Sync library ───────────────────────────────────────────────
@@ -246,6 +350,8 @@ export async function syncSteamToNotion(
       recentByAppId,
       achievementsMap,
       storeDetailsMap,
+      playerCountMap,
+      steamapisDetailsMap,
       (msg) => report(msg)
     );
 
@@ -333,6 +439,27 @@ export async function syncSteamToNotion(
       );
     }
 
+    // ── Step 14: Sync groups ───────────────────────────────────────────────
+    let groupsCount = 0;
+    if (groups.length > 0) {
+      report(`Synchronisation des groupes Steam (${groups.length})...`);
+      groupsCount = await syncGroups(notion, groupsDbId, groups, (msg) =>
+        report(msg)
+      );
+    }
+
+    // ── Step 15: Sync in-game stats ────────────────────────────────────────
+    let statsCount = 0;
+    if (statsData.length > 0) {
+      report(`Synchronisation des statistiques (${statsData.length} jeux)...`);
+      statsCount = await syncStats(
+        notion,
+        statsDbId,
+        statsData,
+        (msg) => report(msg)
+      );
+    }
+
     // ── Step 13: Profile page ──────────────────────────────────────────────
     report("Mise à jour du profil...");
     const profilePageId = await findOrCreateProfilePage(
@@ -350,10 +477,11 @@ export async function syncSteamToNotion(
       playerBadges,
       wishlistCount: wishlist.length,
       workshopCount: workshopItems.length,
+      groupsCount: groups.length,
     });
 
     report(
-      `Terminé ! ${gamesCount} jeux · ${achievementsCount} succès · ${wishlistCount} souhaits · ${friendsCount} amis · ${badgesCount} badges · ${inventoryCount} objets · ${workshopSyncCount} workshop`
+      `Terminé ! ${gamesCount} jeux · ${achievementsCount} succès · ${wishlistCount} souhaits · ${friendsCount} amis · ${badgesCount} badges · ${inventoryCount} objets · ${workshopSyncCount} workshop · ${groupsCount} groupes · ${statsCount} stats`
     );
 
     return {
@@ -367,6 +495,8 @@ export async function syncSteamToNotion(
       badgesDbId,
       inventoryDbId,
       workshopDbId,
+      groupsDbId,
+      statsDbId,
       profilePageId,
       gamesCount,
       achievementsCount,
@@ -375,6 +505,8 @@ export async function syncSteamToNotion(
       badgesCount,
       inventoryCount,
       workshopCount: workshopSyncCount,
+      groupsCount,
+      statsCount,
     };
   } catch (err) {
     const message =
@@ -558,7 +690,9 @@ function buildLibraryDbSchema() {
     "Succès débloqués": { number: { format: "number" } },
     "Total succès": { number: { format: "number" } },
     "% Succès": { number: { format: "number" } },
+    "Joueurs actuels": { number: { format: "number" } },
     "Page Steam": { url: {} },
+    "Site web": { url: {} },
     Statut: {
       select: {
         options: [
@@ -567,6 +701,15 @@ function buildLibraryDbSchema() {
           { name: "En cours", color: "blue" },
           { name: "Joué", color: "green" },
           { name: "Complété à 100%", color: "purple" },
+        ],
+      },
+    },
+    "Support manette": {
+      select: {
+        options: [
+          { name: "Complet", color: "green" },
+          { name: "Partiel", color: "yellow" },
+          { name: "Aucun", color: "gray" },
         ],
       },
     },
@@ -581,13 +724,17 @@ function buildLibraryDbSchema() {
       },
     },
     Genres: { multi_select: { options: [] } },
+    Catégories: { multi_select: { options: [] } },
     Développeur: { rich_text: {} },
     Éditeur: { rich_text: {} },
     "Date de sortie": { date: {} },
     Metacritic: { number: { format: "number" } },
+    Recommandations: { number: { format: "number" } },
+    "Âge requis": { number: { format: "number" } },
     Description: { rich_text: {} },
     Gratuit: { checkbox: {} },
     "Prix (€)": { number: { format: "number" } },
+    "Nombre de DLC": { number: { format: "number" } },
     "Header (URL)": { url: {} },
     "Capsule (URL)": { url: {} },
     "Portrait (URL)": { url: {} },
@@ -719,6 +866,24 @@ function buildWorkshopDbSchema() {
   };
 }
 
+function buildGroupsDbSchema() {
+  return {
+    Groupe: { title: {} },
+    "Groupe ID": { rich_text: {} },
+    "URL Steam": { url: {} },
+  };
+}
+
+function buildStatsDbSchema() {
+  return {
+    Stat: { title: {} },
+    Jeu: { rich_text: {} },
+    "App ID": { number: { format: "number" } },
+    Valeur: { number: { format: "number" } },
+    "Mis à jour": { date: {} },
+  };
+}
+
 // ─── Achievements fetching ────────────────────────────────────────────────────
 
 interface AchievementEntry {
@@ -786,6 +951,8 @@ async function syncGames(
     { unlocked: number; total: number; entries: AchievementEntry[] }
   >,
   storeDetailsMap: Map<number, AppDetails>,
+  playerCountMap: Map<number, number>,
+  steamapisDetailsMap: Map<number, SteamapisAppDetails>,
   onProgress: (msg: string) => void
 ): Promise<number> {
   // Fetch all existing entries to build an appId → { pageId, hasGallery } map
@@ -812,9 +979,11 @@ async function syncGames(
     const existingEntry = existingByAppId.get(game.appid);
     const ach = achievementsMap.get(game.appid);
     const recent = recentByAppId.get(game.appid);
-
     const storeDetails = storeDetailsMap.get(game.appid);
-    const properties = buildGameProperties(game, recent, ach, storeDetails);
+    const playerCount = playerCountMap.get(game.appid);
+    const steamapisDetails = steamapisDetailsMap.get(game.appid);
+
+    const properties = buildGameProperties(game, recent, ach, storeDetails, playerCount, steamapisDetails);
     // library_hero.jpg is the cinematic banner from Steam Library (1920x620)
     const coverUrl = getGameHeroImageUrl(game.appid);
     const iconUrl = game.img_icon_url
@@ -910,7 +1079,9 @@ function buildGameProperties(
   game: OwnedGame,
   recent?: RecentlyPlayedGame,
   ach?: { unlocked: number; total: number },
-  store?: AppDetails
+  store?: AppDetails,
+  playerCount?: number,
+  steamapisDetails?: SteamapisAppDetails
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Record<string, any> {
   const playtimeHours = minutesToHours(game.playtime_forever);
@@ -952,6 +1123,7 @@ function buildGameProperties(
   if (macH > 0) props["Mac (h)"] = { number: macH };
   if (linH > 0) props["Linux (h)"] = { number: linH };
   if (deckH > 0) props["Steam Deck (h)"] = { number: deckH };
+  if (playerCount && playerCount > 0) props["Joueurs actuels"] = { number: playerCount };
 
   if (ach && ach.total > 0) {
     props["Succès débloqués"] = { number: ach.unlocked };
@@ -998,6 +1170,63 @@ function buildGameProperties(
     props["Gratuit"] = { checkbox: store.is_free };
     if (!store.is_free && store.price_overview) {
       props["Prix (€)"] = { number: store.price_overview.final / 100 };
+    }
+  }
+
+  // Enriched fields from steamapis.com (optional — only for recently played)
+  if (steamapisDetails) {
+    if (steamapisDetails.website) {
+      props["Site web"] = { url: steamapisDetails.website };
+    }
+    if (steamapisDetails.controllerSupport) {
+      const label =
+        steamapisDetails.controllerSupport === "full"
+          ? "Complet"
+          : steamapisDetails.controllerSupport === "partial"
+          ? "Partiel"
+          : null;
+      if (label) props["Support manette"] = { select: { name: label } };
+    }
+    if (steamapisDetails.recommendations?.total != null) {
+      props["Recommandations"] = { number: steamapisDetails.recommendations.total };
+    }
+    if (steamapisDetails.requiredAge > 0) {
+      props["Âge requis"] = { number: steamapisDetails.requiredAge };
+    }
+    if (steamapisDetails.categories && steamapisDetails.categories.length > 0) {
+      props["Catégories"] = {
+        multi_select: steamapisDetails.categories
+          .slice(0, 20)
+          .map((c) => ({ name: c.description })),
+      };
+    }
+    if (steamapisDetails.dlc && steamapisDetails.dlc.length > 0) {
+      props["Nombre de DLC"] = { number: steamapisDetails.dlc.length };
+    }
+    // Prefer steamapis genres/dev/pub if not already set from store API
+    if (!store && steamapisDetails.genres && steamapisDetails.genres.length > 0) {
+      props["Genres"] = {
+        multi_select: steamapisDetails.genres.map((g) => ({ name: g.description })),
+      };
+    }
+    if (!store && steamapisDetails.developers && steamapisDetails.developers.length > 0) {
+      props["Développeur"] = {
+        rich_text: [{ text: { content: steamapisDetails.developers.join(", ") } }],
+      };
+    }
+    if (!store && steamapisDetails.publishers && steamapisDetails.publishers.length > 0) {
+      props["Éditeur"] = {
+        rich_text: [{ text: { content: steamapisDetails.publishers.join(", ") } }],
+      };
+    }
+    if (!store && steamapisDetails.metacritic?.score != null) {
+      props["Metacritic"] = { number: steamapisDetails.metacritic.score };
+    }
+    if (!store) {
+      props["Gratuit"] = { checkbox: steamapisDetails.isFree };
+      if (!steamapisDetails.isFree && steamapisDetails.priceOverview?.final != null) {
+        props["Prix (€)"] = { number: steamapisDetails.priceOverview.final / 100 };
+      }
     }
   }
 
@@ -1180,6 +1409,7 @@ interface ProfileData {
   playerBadges: PlayerBadgesData | null;
   wishlistCount?: number;
   workshopCount?: number;
+  groupsCount?: number;
 }
 
 async function updateProfilePage(
@@ -1214,7 +1444,7 @@ async function updateProfilePage(
 }
 
 function buildProfileBlocks(data: ProfileData): BlockObjectRequest[] {
-  const { profile, steamLevel, friendCount, bans, ownedGames, recentGames, playerBadges, wishlistCount, workshopCount } =
+  const { profile, steamLevel, friendCount, bans, ownedGames, recentGames, playerBadges, wishlistCount, workshopCount, groupsCount } =
     data;
 
   const totalPlaytime = Math.round(
@@ -1403,6 +1633,22 @@ function buildProfileBlocks(data: ProfileData): BlockObjectRequest[] {
                 {
                   type: "text" as const,
                   text: { content: `${workshopCount} élément(s) publiés sur le Workshop` },
+                },
+              ],
+              color: "default" as const,
+            },
+          },
+        ]
+      : []),
+    ...(groupsCount != null && groupsCount > 0
+      ? [
+          {
+            type: "bulleted_list_item" as const,
+            bulleted_list_item: {
+              rich_text: [
+                {
+                  type: "text" as const,
+                  text: { content: `Membre de ${groupsCount} groupe(s) Steam` },
                 },
               ],
               color: "default" as const,
@@ -2128,6 +2374,111 @@ async function syncWorkshop(
 
   onProgress(`${synced} éléments Workshop synchronisés.`);
   return synced;
+}
+
+// ─── Groups sync ──────────────────────────────────────────────────────────────
+
+async function syncGroups(
+  notion: Client,
+  dbId: string,
+  groupIds: string[],
+  onProgress: (msg: string) => void
+): Promise<number> {
+  if (groupIds.length === 0) return 0;
+
+  const existing = await fetchAllDatabasePages(notion, dbId);
+  const existingByGroupId = new Map<string, string>(); // groupId → pageId
+  for (const page of existing) {
+    const idProp = page.properties["Groupe ID"];
+    if (idProp?.type === "rich_text") {
+      const gid = idProp.rich_text.map((t: { plain_text: string }) => t.plain_text).join("");
+      if (gid) existingByGroupId.set(gid, page.id);
+    }
+  }
+
+  let synced = 0;
+  await batchProcess(groupIds, 5, 600, async (groupId) => {
+    const groupUrl = `https://steamcommunity.com/gid/${groupId}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const properties: Record<string, any> = {
+      Groupe: { title: [{ text: { content: `Groupe ${groupId}` } }] },
+      "Groupe ID": { rich_text: [{ text: { content: groupId } }] },
+      "URL Steam": { url: groupUrl },
+    };
+
+    const existingPageId = existingByGroupId.get(groupId);
+    if (existingPageId) {
+      await notionRetry(() =>
+        notion.pages.update({ page_id: existingPageId, properties })
+      );
+    } else {
+      await notionRetry(() =>
+        notion.pages.create({ parent: { database_id: dbId }, properties })
+      );
+    }
+    synced++;
+  });
+
+  onProgress(`${synced} groupes synchronisés.`);
+  return synced;
+}
+
+// ─── Stats sync ───────────────────────────────────────────────────────────────
+
+async function syncStats(
+  notion: Client,
+  dbId: string,
+  statsData: Array<{ gameName: string; appId: number; stats: GameStatEntry[] }>,
+  onProgress: (msg: string) => void
+): Promise<number> {
+  if (statsData.length === 0) return 0;
+
+  const existing = await fetchAllDatabasePages(notion, dbId);
+  const existingByKey = new Map<string, string>(); // "appId::statName" → pageId
+  for (const page of existing) {
+    const appIdProp = page.properties["App ID"];
+    const statProp = page.properties["Stat"];
+    const appId =
+      appIdProp?.type === "number" ? (appIdProp.number ?? 0) : 0;
+    const statName =
+      statProp?.type === "title"
+        ? statProp.title.map((t: { plain_text: string }) => t.plain_text).join("")
+        : "";
+    if (appId && statName) existingByKey.set(`${appId}::${statName}`, page.id);
+  }
+
+  const today = new Date().toISOString().split("T")[0];
+  let total = 0;
+
+  for (const { gameName, appId, stats } of statsData) {
+    const capped = stats.slice(0, 100);
+    await batchProcess(capped, 5, 800, async (stat) => {
+      const key = `${appId}::${stat.name}`;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const properties: Record<string, any> = {
+        Stat: { title: [{ text: { content: stat.name.slice(0, 2000) } }] },
+        Jeu: { rich_text: [{ text: { content: gameName.slice(0, 2000) } }] },
+        "App ID": { number: appId },
+        Valeur: { number: stat.value },
+        "Mis à jour": { date: { start: today } },
+      };
+
+      const existingPageId = existingByKey.get(key);
+      if (existingPageId) {
+        await notionRetry(() =>
+          notion.pages.update({ page_id: existingPageId, properties })
+        );
+      } else {
+        await notionRetry(() =>
+          notion.pages.create({ parent: { database_id: dbId }, properties })
+        );
+      }
+      total++;
+    });
+  }
+
+  onProgress(`${total} statistiques synchronisées.`);
+  return total;
 }
 
 // ─── Schema migration ─────────────────────────────────────────────────────────

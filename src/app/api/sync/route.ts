@@ -48,6 +48,8 @@ export async function POST(_request: NextRequest) {
           existingBadgesDbId: session.notionBadgesDbId,
           existingInventoryDbId: session.notionInventoryDbId,
           existingWorkshopDbId: session.notionWorkshopDbId,
+          existingGroupsDbId: session.notionGroupsDbId,
+          existingStatsDbId: session.notionStatsDbId,
           onProgress: (message) => send({ type: "progress", message }),
         });
 
@@ -63,6 +65,8 @@ export async function POST(_request: NextRequest) {
             badgesDbId: result.badgesDbId,
             inventoryDbId: result.inventoryDbId,
             workshopDbId: result.workshopDbId,
+            groupsDbId: result.groupsDbId,
+            statsDbId: result.statsDbId,
             profilePageId: result.profilePageId,
             gamesCount: result.gamesCount,
             achievementsCount: result.achievementsCount,
@@ -71,6 +75,8 @@ export async function POST(_request: NextRequest) {
             badgesCount: result.badgesCount,
             inventoryCount: result.inventoryCount,
             workshopCount: result.workshopCount,
+            groupsCount: result.groupsCount,
+            statsCount: result.statsCount,
           });
         } else {
           send({ type: "error", message: result.error ?? "Erreur inconnue" });
@@ -116,6 +122,8 @@ export async function PATCH(request: NextRequest) {
     badgesDbId,
     inventoryDbId,
     workshopDbId,
+    groupsDbId,
+    statsDbId,
     profilePageId,
     gamesCount,
     achievementsCount,
@@ -129,6 +137,8 @@ export async function PATCH(request: NextRequest) {
     badgesDbId?: string;
     inventoryDbId?: string;
     workshopDbId?: string;
+    groupsDbId?: string;
+    statsDbId?: string;
     profilePageId?: string;
     gamesCount?: number;
     achievementsCount?: number;
@@ -143,6 +153,8 @@ export async function PATCH(request: NextRequest) {
   if (badgesDbId) session.notionBadgesDbId = badgesDbId;
   if (inventoryDbId) session.notionInventoryDbId = inventoryDbId;
   if (workshopDbId) session.notionWorkshopDbId = workshopDbId;
+  if (groupsDbId) session.notionGroupsDbId = groupsDbId;
+  if (statsDbId) session.notionStatsDbId = statsDbId;
   if (profilePageId) session.notionProfilePageId = profilePageId;
   session.lastSyncAt = new Date().toISOString();
   if (gamesCount !== undefined && achievementsCount !== undefined) {
