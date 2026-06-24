@@ -763,28 +763,38 @@ export interface InventoryItem {
   marketable: boolean;
   commodity: boolean;
   tags?: InventoryTag[];
+  /** Which game this item comes from (e.g. "CS2", "Community", "TF2"). */
+  source?: string;
 }
 
 /**
- * Steam Community inventory (app 753 / context 6 = community items:
- * trading cards, backgrounds, emoticons, profile frames, …).
- * Returns up to 5000 items. Returns empty array if private or unavailable.
+ * Fetch one Steam inventory page (all pages via pagination).
+ * Returns empty array if private, unavailable, or on error.
  */
-export async function getInventoryItems(steamId: string): Promise<InventoryItem[]> {
-  const allItems: InventoryItem[] = [];
+async function fetchSteamInventory(
+  steamId: string,
+  appId: number,
+  contextId: number,
+  source: string
+): Promise<InventoryItem[]> {
+  const items: InventoryItem[] = [];
   let lastAssetId: string | undefined;
-
   try {
     while (true) {
       const params = new URLSearchParams({ l: "english", count: "5000" });
       if (lastAssetId) params.set("start_assetid", lastAssetId);
-      const url = `https://steamcommunity.com/inventory/${steamId}/753/6?${params.toString()}`;
+      const url = `https://steamcommunity.com/inventory/${steamId}/${appId}/${contextId}?${params.toString()}`;
       const res = await fetch(url, {
         cache: "no-store",
-        headers: { "User-Agent": "SteamTrackerNotion/1.0" },
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          Accept: "application/json, text/plain, */*",
+        },
       });
-      if (!res.ok) break;
-
+      if (!res.ok) {
+        console.warn(`[inventory] ${source} (${appId}/${contextId}): HTTP ${res.status}`);
+        break;
+      }
       const data = (await res.json()) as {
         success?: number | boolean;
         assets?: Array<{ assetid: string; classid: string; instanceid: string }>;
@@ -802,22 +812,16 @@ export async function getInventoryItems(steamId: string): Promise<InventoryItem[
         }>;
         more_items?: number;
         last_assetid?: string;
-        total_inventory_count?: number;
       };
-
-      // success can be 1, true, or absent; false/0 means private or error
       if (data.success === false || data.success === 0) break;
       if (!data.assets?.length || !data.descriptions?.length) break;
-
-      // Build lookup: "classid_instanceid" → description
       const descMap = new Map(
         data.descriptions.map((d) => [`${d.classid}_${d.instanceid}`, d])
       );
-
       for (const asset of data.assets) {
         const desc = descMap.get(`${asset.classid}_${asset.instanceid}`);
         if (!desc) continue;
-        allItems.push({
+        items.push({
           assetid: asset.assetid,
           classid: asset.classid,
           name: desc.name,
@@ -828,15 +832,37 @@ export async function getInventoryItems(steamId: string): Promise<InventoryItem[
           marketable: desc.marketable === 1,
           commodity: desc.commodity === 1,
           tags: desc.tags,
+          source,
         });
       }
-
       if (!data.more_items || !data.last_assetid) break;
       lastAssetId = data.last_assetid;
       await new Promise((r) => setTimeout(r, 1000));
     }
-  } catch {
-    return allItems;
+  } catch (err) {
+    console.warn(`[inventory] ${source} (${appId}/${contextId}) error:`, err);
   }
-  return allItems;
+  console.log(`[inventory] ${source} (${appId}/${contextId}): ${items.length} items`);
+  return items;
+}
+
+/**
+ * Fetch Steam inventory for all major games in parallel.
+ * Covers CS2 (730/2), Steam Community (753/6), TF2 (440/2), Dota 2 (570/2), Rust (252490/2).
+ * Returns empty array if all inventories are private or unavailable.
+ */
+export async function getInventoryItems(steamId: string): Promise<InventoryItem[]> {
+  const sources = [
+    { appId: 730,    contextId: 2, source: "CS2" },
+    { appId: 753,    contextId: 6, source: "Community" },
+    { appId: 440,    contextId: 2, source: "TF2" },
+    { appId: 570,    contextId: 2, source: "Dota 2" },
+    { appId: 252490, contextId: 2, source: "Rust" },
+  ];
+  const results = await Promise.allSettled(
+    sources.map(({ appId, contextId, source }) =>
+      fetchSteamInventory(steamId, appId, contextId, source)
+    )
+  );
+  return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 }

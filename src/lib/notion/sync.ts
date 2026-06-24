@@ -214,18 +214,26 @@ export async function syncSteamToNotion(
       (msg) => report(msg)
     );
 
-    // ── Step 4: Badges, friends, groups, workshop, inventory (parallel) ──
-    report("Récupération badges, amis, groupes, workshop, inventaire...");
-    const [playerBadges, rawFriends, workshopItems, inventoryItems, groups] =
+    // ── Step 4: Badges, friends, groups, workshop (parallel) ─────────────
+    report("Récupération badges, amis, groupes, workshop...");
+    const [playerBadges, rawFriends, workshopItems, groups] =
       await Promise.all([
         getPlayerBadges(steamId),
         getFriendList(steamId),
         getWorkshopItems(steamId),
-        getInventoryItems(steamId),
         hasSteamapisKey()
           ? getSteamapisGroups(steamId)
           : getPlayerGroups(steamId),
       ]);
+
+    // ── Step 4b: Inventory (separate — has its own pagination + rate limit) ─
+    report("Récupération de l'inventaire Steam...");
+    const inventoryItems = await getInventoryItems(steamId);
+    if (inventoryItems.length > 0) {
+      report(`${inventoryItems.length} objet(s) trouvé(s) dans l'inventaire.`);
+    } else {
+      report("Inventaire vide ou privé — ignoré.");
+    }
 
     // ── Step 4b: In-game stats for recently played games ──────────────────
     const statsData: Array<{
@@ -828,7 +836,18 @@ function buildBadgesDbSchema() {
 function buildInventoryDbSchema() {
   return {
     Objet: { title: {} },
-    "Class ID": { rich_text: {} },
+    Jeu: {
+      select: {
+        options: [
+          { name: "CS2", color: "yellow" },
+          { name: "Community", color: "blue" },
+          { name: "TF2", color: "red" },
+          { name: "Dota 2", color: "purple" },
+          { name: "Rust", color: "orange" },
+          { name: "Autre", color: "default" },
+        ],
+      },
+    },
     Type: {
       select: {
         options: [
@@ -839,11 +858,21 @@ function buildInventoryDbSchema() {
           { name: "Profile Modifier", color: "pink" },
           { name: "Avatar Frame", color: "orange" },
           { name: "Mini-Profile Background", color: "default" },
+          { name: "Weapon Skin", color: "red" },
+          { name: "Knife", color: "pink" },
+          { name: "Gloves", color: "brown" },
+          { name: "Case", color: "gray" },
+          { name: "Key", color: "yellow" },
+          { name: "Sticker", color: "blue" },
+          { name: "Agent", color: "green" },
+          { name: "Graffiti", color: "purple" },
+          { name: "Music Kit", color: "orange" },
           { name: "Autre", color: "default" },
         ],
       },
     },
     Quantité: { number: { format: "number" } },
+    "Class ID": { rich_text: {} },
     "Image (URL)": { url: {} },
     Échangeable: { checkbox: {} },
     Vendable: { checkbox: {} },
@@ -2247,23 +2276,35 @@ async function syncInventory(
   }
 
   // Normalise item type string to select option name
-  function normaliseType(raw: string): string {
-    if (/foil/i.test(raw) && /trading card/i.test(raw)) return "Foil Trading Card";
-    if (/trading card/i.test(raw)) return "Trading Card";
-    if (/background/i.test(raw)) return "Background";
-    if (/emoticon/i.test(raw)) return "Emoticon";
-    if (/profile modifier/i.test(raw)) return "Profile Modifier";
-    if (/avatar frame/i.test(raw)) return "Avatar Frame";
-    if (/mini.profile/i.test(raw)) return "Mini-Profile Background";
+  function normaliseType(raw: string, source?: string): string {
+    const r = raw.toLowerCase();
+    if (/foil/i.test(r) && /trading card/i.test(r)) return "Foil Trading Card";
+    if (/trading card/i.test(r)) return "Trading Card";
+    if (/background/i.test(r)) return "Background";
+    if (/emoticon/i.test(r)) return "Emoticon";
+    if (/profile modifier/i.test(r)) return "Profile Modifier";
+    if (/avatar frame/i.test(r)) return "Avatar Frame";
+    if (/mini.profile/i.test(r)) return "Mini-Profile Background";
+    if (/music kit/i.test(r)) return "Music Kit";
+    if (/graffiti/i.test(r) || /spray/i.test(r)) return "Graffiti";
+    if (/sticker/i.test(r)) return "Sticker";
+    if (/agent/i.test(r)) return "Agent";
+    if (/gloves|hand wraps/i.test(r)) return "Gloves";
+    if (/★/.test(raw) || /knife|karambit|butterfly|bayonet|falchion|flip|gut|huntsman|navaja|paracord|shadow|skeleton|stiletto|talon|ursus/i.test(r)) return "Knife";
+    if (/case/i.test(r) && !/key/i.test(r)) return "Case";
+    if (/key/i.test(r)) return "Key";
+    if (source === "CS2") return "Weapon Skin";
     return "Autre";
   }
 
   let synced = 0;
   await batchProcess(aggregated, 5, 1000, async ({ item, quantity }) => {
-    const typeName = normaliseType(item.type);
+    const typeName = normaliseType(item.type, item.source);
+    const gameLabel = item.source ?? "Autre";
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const properties: Record<string, any> = {
       Objet: { title: [{ text: { content: item.name } }] },
+      Jeu: { select: { name: gameLabel } },
       "Class ID": { rich_text: [{ text: { content: item.classid } }] },
       Type: { select: { name: typeName } },
       Quantité: { number: quantity },
