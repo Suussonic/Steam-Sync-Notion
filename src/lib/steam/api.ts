@@ -290,6 +290,8 @@ export interface AppDetails {
   categories?: AppCategory[];
   release_date?: { coming_soon: boolean; date: string };
   metacritic?: { score: number; url: string };
+  recommendations?: { total: number };
+  controller_support?: string;
   is_free: boolean;
   price_overview?: {
     currency: string;
@@ -300,6 +302,7 @@ export interface AppDetails {
     final_formatted: string;
   };
   header_image?: string;
+  capsule_image?: string;
   background?: string;
   website?: string;
   platforms?: { windows: boolean; mac: boolean; linux: boolean };
@@ -633,6 +636,7 @@ export async function getBulkAppDetails(
   const result = new Map<number, AppDetails>();
   if (appIds.length === 0) return result;
 
+  // First pass: batch requests of 50 (unofficial but fast)
   const BATCH_SIZE = 50;
   for (let i = 0; i < appIds.length; i += BATCH_SIZE) {
     const batch = appIds.slice(i, i + BATCH_SIZE);
@@ -657,6 +661,39 @@ export async function getBulkAppDetails(
       await new Promise((r) => setTimeout(r, 600));
     }
   }
+
+  // Second pass: retry games that failed in the batch fetch.
+  // The multi-appid endpoint is unofficial and may silently drop some games;
+  // individual requests (no locale override) are more reliable.
+  const failed = appIds.filter((id) => !result.has(id));
+  if (failed.length > 0) {
+    const toRetry = failed.slice(0, 150); // cap to avoid excessive latency
+    const CONCURRENCY = 5;
+    for (let i = 0; i < toRetry.length; i += CONCURRENCY) {
+      await Promise.all(
+        toRetry.slice(i, i + CONCURRENCY).map(async (appId) => {
+          try {
+            const url = `https://store.steampowered.com/api/appdetails?appids=${appId}`;
+            const res = await fetch(url, { cache: "no-store" });
+            if (res.ok) {
+              const data = (await res.json()) as Record<
+                string,
+                { success: boolean; data?: AppDetails }
+              >;
+              const entry = data[appId.toString()];
+              if (entry?.success && entry.data) result.set(appId, entry.data);
+            }
+          } catch {
+            // skip individual
+          }
+        })
+      );
+      if (i + CONCURRENCY < toRetry.length) {
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    }
+  }
+
   return result;
 }
 

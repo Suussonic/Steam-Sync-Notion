@@ -182,9 +182,22 @@ export async function syncSteamToNotion(
     report(`Métadonnées récupérées pour ${storeDetailsMap.size} jeux.`);
 
     // ── Step 2b: Enriched app details via steamapis.com (optional) ─────────
-    const steamapisDetailsMap = hasSteamapisKey()
-      ? await getBulkSteamapisAppDetails(recentGames.map((g) => g.appid))
-      : new Map<number, SteamapisAppDetails>();
+    // Cover games played in the last 30 days (not just Steam's 14-day window)
+    const thirtyDaysAgo = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
+    const steamapisAppIds = hasSteamapisKey()
+      ? [
+          ...new Set([
+            ...recentGames.map((g) => g.appid),
+            ...ownedGames
+              .filter((g) => g.rtime_last_played && g.rtime_last_played > thirtyDaysAgo)
+              .map((g) => g.appid),
+          ]),
+        ].slice(0, 50)
+      : [];
+    const steamapisDetailsMap =
+      steamapisAppIds.length > 0
+        ? await getBulkSteamapisAppDetails(steamapisAppIds)
+        : new Map<number, SteamapisAppDetails>();
     if (hasSteamapisKey() && steamapisDetailsMap.size > 0) {
       report(`Données enrichies steamapis.com pour ${steamapisDetailsMap.size} jeux.`);
     }
@@ -747,6 +760,7 @@ function buildLibraryDbSchema() {
     "Capsule (URL)": { url: {} },
     "Portrait (URL)": { url: {} },
     Galerie: { checkbox: {} },
+    "Galerie v2": { checkbox: {} },
   };
 }
 
@@ -984,17 +998,19 @@ async function syncGames(
   steamapisDetailsMap: Map<number, SteamapisAppDetails>,
   onProgress: (msg: string) => void
 ): Promise<number> {
-  // Fetch all existing entries to build an appId → { pageId, hasGallery } map
+  // Fetch all existing entries to build an appId → { pageId, hasGallery, hasGalleryV2 } map
   onProgress("Lecture des entrées existantes...");
   const existing = await fetchAllDatabasePages(notion, dbId);
-  const existingByAppId = new Map<number, { pageId: string; hasGallery: boolean }>();
+  const existingByAppId = new Map<number, { pageId: string; hasGallery: boolean; hasGalleryV2: boolean }>();
   for (const page of existing) {
     const appIdProp = page.properties["App ID"];
     const galerieProp = page.properties["Galerie"];
+    const galerieV2Prop = page.properties["Galerie v2"];
     if (appIdProp?.type === "number" && appIdProp.number !== null) {
       existingByAppId.set(appIdProp.number, {
         pageId: page.id,
         hasGallery: galerieProp?.type === "checkbox" ? galerieProp.checkbox : false,
+        hasGalleryV2: galerieV2Prop?.type === "checkbox" ? galerieV2Prop.checkbox : false,
       });
     }
   }
@@ -1013,8 +1029,8 @@ async function syncGames(
     const steamapisDetails = steamapisDetailsMap.get(game.appid);
 
     const properties = buildGameProperties(game, recent, ach, storeDetails, playerCount, steamapisDetails);
-    // library_hero.jpg is the cinematic banner from Steam Library (1920x620)
-    const coverUrl = getGameHeroImageUrl(game.appid);
+    // Prefer header_image from Store API (new Akamai CDN) over constructed hero URL (old CDN, 404 for newer games)
+    const coverUrl = storeDetails?.header_image ?? getGameHeroImageUrl(game.appid);
     const iconUrl = game.img_icon_url
       ? getGameIconUrl(game.appid, game.img_icon_url)
       : null;
@@ -1027,8 +1043,8 @@ async function syncGames(
           cover: { type: "external", external: { url: coverUrl } },
         })
       );
-      // Add gallery images if not already done
       if (!existingEntry.hasGallery) {
+        // First time: add gallery blocks, mark both Galerie and Galerie v2 as done
         await notionRetry(() =>
           notion.blocks.children.append({
             block_id: existingEntry.pageId,
@@ -1038,7 +1054,16 @@ async function syncGames(
         await notionRetry(() =>
           notion.pages.update({
             page_id: existingEntry.pageId,
-            properties: { Galerie: { checkbox: true } },
+            properties: { Galerie: { checkbox: true }, "Galerie v2": { checkbox: true } },
+          })
+        );
+      } else if (!existingEntry.hasGalleryV2 && storeDetails?.header_image) {
+        // One-time migration: replace old cdn.cloudflare blocks with new Akamai URLs
+        await replaceGalleryBlocks(notion, existingEntry.pageId, game.appid, storeDetails);
+        await notionRetry(() =>
+          notion.pages.update({
+            page_id: existingEntry.pageId,
+            properties: { "Galerie v2": { checkbox: true } },
           })
         );
       }
@@ -1050,7 +1075,7 @@ async function syncGames(
           ...(iconUrl
             ? { icon: { type: "external", external: { url: iconUrl } } }
             : {}),
-          properties: { ...properties, Galerie: { checkbox: true } },
+          properties: { ...properties, Galerie: { checkbox: true }, "Galerie v2": { checkbox: true } },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           children: buildGameImageBlocks(game.appid, storeDetails) as any,
         })
@@ -1065,7 +1090,69 @@ async function syncGames(
   return synced;
 }
 
+/**
+ * Replaces the "Galerie" section in a Notion page (heading_3 + image blocks)
+ * with fresh blocks using correct Store API URLs.
+ * Used for one-time migration from old cdn.cloudflare URLs to new Akamai URLs.
+ */
+async function replaceGalleryBlocks(
+  notion: Client,
+  pageId: string,
+  appId: number,
+  store: AppDetails
+): Promise<void> {
+  // 1. List child blocks to find old gallery section
+  const { results } = await notionRetry(() =>
+    notion.blocks.children.list({ block_id: pageId, page_size: 100 })
+  );
+
+  // 2. Identify heading_3 "Galerie" + subsequent image blocks
+  let inGallery = false;
+  const toDelete: string[] = [];
+  for (const block of results) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const b = block as any;
+    if (b.type === "heading_3") {
+      const text: string = b.heading_3?.rich_text?.[0]?.plain_text ?? "";
+      if (text === "Galerie") {
+        inGallery = true;
+        toDelete.push(b.id);
+        continue;
+      }
+      if (inGallery) break; // Another heading = end of gallery section
+    }
+    if (inGallery) {
+      if (b.type === "image") {
+        toDelete.push(b.id);
+      } else {
+        break; // Stop at first non-image block
+      }
+    }
+  }
+
+  // 3. Delete old gallery blocks one by one
+  for (const blockId of toDelete) {
+    try {
+      await notionRetry(() => notion.blocks.delete({ block_id: blockId }));
+    } catch {
+      // Non-critical: block may have been deleted already
+    }
+  }
+
+  // 4. Append fresh gallery blocks with correct Akamai URLs
+  await notionRetry(() =>
+    notion.blocks.children.append({
+      block_id: pageId,
+      children: buildGameImageBlocks(appId, store) as BlockObjectRequest[],
+    })
+  );
+}
+
 function buildGameImageBlocks(appId: number, store?: AppDetails): BlockObjectRequest[] {
+  // Prefer header_image from Store API (new Akamai CDN) — old cdn.cloudflare header.jpg returns 404 for newer games
+  const headerUrl = store?.header_image
+    ?? `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/header.jpg`;
+
   const blocks: BlockObjectRequest[] = [
     {
       type: "heading_3",
@@ -1079,14 +1166,7 @@ function buildGameImageBlocks(appId: number, store?: AppDetails): BlockObjectReq
       type: "image",
       image: {
         type: "external",
-        external: { url: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/header.jpg` },
-      },
-    },
-    {
-      type: "image",
-      image: {
-        type: "external",
-        external: { url: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/capsule_616x353.jpg` },
+        external: { url: headerUrl },
       },
     },
   ];
@@ -1189,6 +1269,9 @@ function buildGameProperties(
     if (store.metacritic?.score) {
       props["Metacritic"] = { number: store.metacritic.score };
     }
+    if (store.recommendations?.total) {
+      props["Recommandations"] = { number: store.recommendations.total };
+    }
     if (store.short_description) {
       props["Description"] = {
         rich_text: [
@@ -1200,14 +1283,36 @@ function buildGameProperties(
     if (!store.is_free && store.price_overview) {
       props["Prix (€)"] = { number: store.price_overview.final / 100 };
     }
+    // Fields available in the Store API that were previously steamapis-only
+    if (store.categories && store.categories.length > 0) {
+      props["Catégories"] = {
+        multi_select: store.categories.slice(0, 20).map((c) => ({ name: c.description })),
+      };
+      // Derive controller support from Steam category IDs (18=partial, 28=full)
+      const hasFull = store.categories.some((c) => c.id === 28);
+      const hasPartial = store.categories.some((c) => c.id === 18);
+      if (hasFull) props["Support manette"] = { select: { name: "Complet" } };
+      else if (hasPartial) props["Support manette"] = { select: { name: "Partiel" } };
+    }
+    if (store.website) {
+      props["Site web"] = { url: store.website };
+    }
+    const requiredAge = Number(store.required_age ?? 0);
+    if (requiredAge > 0) {
+      props["Âge requis"] = { number: requiredAge };
+    }
+    if (store.dlc && store.dlc.length > 0) {
+      props["Nombre de DLC"] = { number: store.dlc.length };
+    }
   }
 
-  // Enriched fields from steamapis.com (optional — only for recently played)
+  // Enriched fields from steamapis.com — overrides Store API only when steamapis has richer data
   if (steamapisDetails) {
-    if (steamapisDetails.website) {
+    // Only overwrite if the Store API didn't already supply the value
+    if (!props["Site web"] && steamapisDetails.website) {
       props["Site web"] = { url: steamapisDetails.website };
     }
-    if (steamapisDetails.controllerSupport) {
+    if (!props["Support manette"] && steamapisDetails.controllerSupport) {
       const label =
         steamapisDetails.controllerSupport === "full"
           ? "Complet"
@@ -1216,23 +1321,24 @@ function buildGameProperties(
           : null;
       if (label) props["Support manette"] = { select: { name: label } };
     }
+    // steamapis has more precise recommendation counts — always prefer it
     if (steamapisDetails.recommendations?.total != null) {
       props["Recommandations"] = { number: steamapisDetails.recommendations.total };
     }
-    if (steamapisDetails.requiredAge > 0) {
+    if (!props["Âge requis"] && steamapisDetails.requiredAge > 0) {
       props["Âge requis"] = { number: steamapisDetails.requiredAge };
     }
-    if (steamapisDetails.categories && steamapisDetails.categories.length > 0) {
+    if (!props["Catégories"] && steamapisDetails.categories && steamapisDetails.categories.length > 0) {
       props["Catégories"] = {
         multi_select: steamapisDetails.categories
           .slice(0, 20)
           .map((c) => ({ name: c.description })),
       };
     }
-    if (steamapisDetails.dlc && steamapisDetails.dlc.length > 0) {
+    if (!props["Nombre de DLC"] && steamapisDetails.dlc && steamapisDetails.dlc.length > 0) {
       props["Nombre de DLC"] = { number: steamapisDetails.dlc.length };
     }
-    // Prefer steamapis genres/dev/pub if not already set from store API
+    // Fill genres/dev/pub/metacritic/price only if Store API didn't provide them
     if (!store && steamapisDetails.genres && steamapisDetails.genres.length > 0) {
       props["Genres"] = {
         multi_select: steamapisDetails.genres.map((g) => ({ name: g.description })),
@@ -1259,11 +1365,11 @@ function buildGameProperties(
     }
   }
 
-  // Static image URLs (always available from appid, no extra API calls)
-  props["Header (URL)"] = { url: getGameHeaderImageUrl(game.appid) };
-  props["Capsule (URL)"] = { url: getGameCapsuleImageUrl(game.appid) };
+  // Image URLs: prefer Store API values (new Akamai CDN) over constructed ones (old CDN, 404 for newer games)
+  props["Header (URL)"] = { url: store?.header_image ?? getGameHeaderImageUrl(game.appid) };
+  props["Capsule (URL)"] = { url: store?.capsule_image ?? getGameCapsuleImageUrl(game.appid) };
   props["Portrait (URL)"] = {
-    url: `https://cdn.cloudflare.steamstatic.com/steam/apps/${game.appid}/library_600x900_2x.jpg`,
+    url: store?.header_image ?? `https://cdn.cloudflare.steamstatic.com/steam/apps/${game.appid}/library_600x900_2x.jpg`,
   };
 
   return props;
