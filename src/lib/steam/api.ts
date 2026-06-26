@@ -85,15 +85,15 @@ export interface SteamPlayerSummary {
 // ─── URL helpers ─────────────────────────────────────────────────────────────
 
 export function getGameHeaderImageUrl(appId: number): string {
-  return `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/header.jpg`;
+  return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
 }
 
 export function getGameHeroImageUrl(appId: number): string {
-  return `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/library_hero.jpg`;
+  return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/library_hero.jpg`;
 }
 
 export function getGameCapsuleImageUrl(appId: number): string {
-  return `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/capsule_616x353.jpg`;
+  return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/capsule_616x353.jpg`;
 }
 
 export function getStorePage(appId: number): string {
@@ -641,13 +641,15 @@ export async function getBulkAppDetails(
 
   syncLog(`[StoreAPI] getBulkAppDetails: ${appIds.length} jeux à récupérer`);
 
-  // First pass: batch requests of 50 (unofficial but fast)
+  // First pass: batch requests of 50 (unofficial but fast).
+  // NOTE: locale params (cc=fr&l=french) cause HTTP 400 on multi-appid requests;
+  // use the bare endpoint here and let individual retries add locale if needed.
   const BATCH_SIZE = 50;
   let batchOk = 0, batchFail = 0;
   for (let i = 0; i < appIds.length; i += BATCH_SIZE) {
     const batch = appIds.slice(i, i + BATCH_SIZE);
     const url =
-      `https://store.steampowered.com/api/appdetails?appids=${batch.join(",")}&cc=fr&l=french`;
+      `https://store.steampowered.com/api/appdetails?appids=${batch.join(",")}`;
     try {
       const res = await fetch(url, { cache: "no-store" });
       if (res.ok) {
@@ -683,15 +685,10 @@ export async function getBulkAppDetails(
   // The multi-appid endpoint is unofficial and may silently drop some games;
   // individual requests (no locale override) are more reliable.
   const failed = appIds.filter((id) => !result.has(id));
-  syncLog(`[StoreAPI] Passe 2 (individuel) — ${failed.length} jeux à réessayer (cap 150)`);
+  syncLog(`[StoreAPI] Passe 2 (individuel) — ${failed.length} jeux à réessayer`);
   if (failed.length > 0) {
-    const toRetry = failed.slice(0, 150); // cap to avoid excessive latency
-    if (failed.length > 150) {
-      syncLog(`[StoreAPI] ATTENTION: ${failed.length - 150} jeux ignorés (dépassement du cap 150)`);
-      // Log the ignored app IDs
-      syncLog(`[StoreAPI] AppIds ignorés: ${failed.slice(150).join(", ")}`);
-    }
-    const CONCURRENCY = 5;
+    const toRetry = failed; // retry ALL failed games
+    const CONCURRENCY = 10;
     let retryOk = 0, retryFail = 0;
     for (let i = 0; i < toRetry.length; i += CONCURRENCY) {
       await Promise.all(

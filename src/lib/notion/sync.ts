@@ -1180,7 +1180,7 @@ async function replaceGalleryBlocks(
 function buildGameImageBlocks(appId: number, store?: AppDetails): BlockObjectRequest[] {
   // Prefer header_image from Store API (new Akamai CDN) — old cdn.cloudflare header.jpg returns 404 for newer games
   const headerUrl = store?.header_image
-    ?? `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/header.jpg`;
+    ?? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
 
   const blocks: BlockObjectRequest[] = [
     {
@@ -1398,7 +1398,7 @@ function buildGameProperties(
   props["Header (URL)"] = { url: store?.header_image ?? getGameHeaderImageUrl(game.appid) };
   props["Capsule (URL)"] = { url: store?.capsule_image ?? getGameCapsuleImageUrl(game.appid) };
   props["Portrait (URL)"] = {
-    url: store?.header_image ?? `https://cdn.cloudflare.steamstatic.com/steam/apps/${game.appid}/library_600x900_2x.jpg`,
+    url: store?.header_image ?? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.appid}/library_600x900_2x.jpg`,
   };
 
   return props;
