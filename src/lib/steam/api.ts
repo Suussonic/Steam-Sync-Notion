@@ -3,6 +3,8 @@
  * Covers all major player data endpoints.
  */
 
+import { syncLog } from "@/lib/logger";
+
 const STEAM_API_BASE = "https://api.steampowered.com";
 
 function key(): string {
@@ -36,6 +38,7 @@ export interface RecentlyPlayedGame {
   playtime_windows_forever?: number;
   playtime_mac_forever?: number;
   playtime_linux_forever?: number;
+  has_community_visible_stats?: boolean;
 }
 
 export interface PlayerAchievement {
@@ -636,8 +639,11 @@ export async function getBulkAppDetails(
   const result = new Map<number, AppDetails>();
   if (appIds.length === 0) return result;
 
+  syncLog(`[StoreAPI] getBulkAppDetails: ${appIds.length} jeux à récupérer`);
+
   // First pass: batch requests of 50 (unofficial but fast)
   const BATCH_SIZE = 50;
+  let batchOk = 0, batchFail = 0;
   for (let i = 0; i < appIds.length; i += BATCH_SIZE) {
     const batch = appIds.slice(i, i + BATCH_SIZE);
     const url =
@@ -651,24 +657,42 @@ export async function getBulkAppDetails(
         >;
         for (const appId of batch) {
           const entry = data[appId.toString()];
-          if (entry?.success && entry.data) result.set(appId, entry.data);
+          if (entry?.success && entry.data) {
+            result.set(appId, entry.data);
+            batchOk++;
+          } else {
+            batchFail++;
+            syncLog(`[StoreAPI] Batch ÉCHEC appId=${appId} — success=${entry?.success ?? "absent"}`);
+          }
         }
+      } else {
+        batchFail += batch.length;
+        syncLog(`[StoreAPI] Batch HTTP ${res.status} pour appIds=${batch.join(",")}`);
       }
-    } catch {
-      // Non-critical: skip this batch and continue
+    } catch (err) {
+      batchFail += batch.length;
+      syncLog(`[StoreAPI] Batch exception: ${String(err)}`);
     }
     if (i + BATCH_SIZE < appIds.length) {
       await new Promise((r) => setTimeout(r, 600));
     }
   }
+  syncLog(`[StoreAPI] Passe 1 terminée — OK=${batchOk}, ÉCHEC=${batchFail}`);
 
   // Second pass: retry games that failed in the batch fetch.
   // The multi-appid endpoint is unofficial and may silently drop some games;
   // individual requests (no locale override) are more reliable.
   const failed = appIds.filter((id) => !result.has(id));
+  syncLog(`[StoreAPI] Passe 2 (individuel) — ${failed.length} jeux à réessayer (cap 150)`);
   if (failed.length > 0) {
     const toRetry = failed.slice(0, 150); // cap to avoid excessive latency
+    if (failed.length > 150) {
+      syncLog(`[StoreAPI] ATTENTION: ${failed.length - 150} jeux ignorés (dépassement du cap 150)`);
+      // Log the ignored app IDs
+      syncLog(`[StoreAPI] AppIds ignorés: ${failed.slice(150).join(", ")}`);
+    }
     const CONCURRENCY = 5;
+    let retryOk = 0, retryFail = 0;
     for (let i = 0; i < toRetry.length; i += CONCURRENCY) {
       await Promise.all(
         toRetry.slice(i, i + CONCURRENCY).map(async (appId) => {
@@ -681,10 +705,21 @@ export async function getBulkAppDetails(
                 { success: boolean; data?: AppDetails }
               >;
               const entry = data[appId.toString()];
-              if (entry?.success && entry.data) result.set(appId, entry.data);
+              if (entry?.success && entry.data) {
+                result.set(appId, entry.data);
+                retryOk++;
+                syncLog(`[StoreAPI] Retry OK appId=${appId} name="${entry.data.name}" header_image=${entry.data.header_image ? "OUI" : "NON"}`);
+              } else {
+                retryFail++;
+                syncLog(`[StoreAPI] Retry ÉCHEC appId=${appId} — success=${entry?.success ?? "absent"}`);
+              }
+            } else {
+              retryFail++;
+              syncLog(`[StoreAPI] Retry HTTP ${res.status} appId=${appId}`);
             }
-          } catch {
-            // skip individual
+          } catch (err) {
+            retryFail++;
+            syncLog(`[StoreAPI] Retry exception appId=${appId}: ${String(err)}`);
           }
         })
       );
@@ -692,6 +727,13 @@ export async function getBulkAppDetails(
         await new Promise((r) => setTimeout(r, 400));
       }
     }
+    syncLog(`[StoreAPI] Passe 2 terminée — OK=${retryOk}, ÉCHEC=${retryFail}`);
+  }
+
+  const finalFailed = appIds.filter((id) => !result.has(id));
+  syncLog(`[StoreAPI] Résultat final — ${result.size} jeux récupérés, ${finalFailed.length} jeux manquants`);
+  if (finalFailed.length > 0) {
+    syncLog(`[StoreAPI] Jeux sans données: ${finalFailed.join(", ")}`);
   }
 
   return result;

@@ -77,6 +77,7 @@ import {
 } from "@/lib/steam/steamapis";
 
 import type { SteamProfile } from "@/lib/steam/openid";
+import { initSyncLog, closeSyncLog, syncLog } from "@/lib/logger";
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -149,7 +150,12 @@ export async function syncSteamToNotion(
   } = options;
 
   const notion = new Client({ auth: notionToken });
-  const report = (msg: string) => onProgress?.(msg);
+  const logPath = initSyncLog();
+  syncLog(`SteamID: ${steamId} | Notion token: ${notionToken.slice(0, 8)}...`);
+  const report = (msg: string) => {
+    syncLog(`[Progress] ${msg}`);
+    onProgress?.(msg);
+  };
 
   try {
     // ── Step 1: Core Steam data + wishlist (parallel) ──────────────────────
@@ -179,7 +185,17 @@ export async function syncSteamToNotion(
       ]),
     ];
     const storeDetailsMap = await getBulkAppDetails(allAppIds);
-    report(`Métadonnées récupérées pour ${storeDetailsMap.size} jeux.`);
+    report(`Métadonnées récupérées pour ${storeDetailsMap.size}/${allAppIds.length} jeux (log: ${logPath}).`);
+    // Log every game's store status for diagnosis
+    for (const id of allAppIds) {
+      const d = storeDetailsMap.get(id);
+      if (!d) {
+        syncLog(`[StoreMap] appId=${id} → ABSENT`);
+      } else if (!d.header_image) {
+        syncLog(`[StoreMap] appId=${id} name="${d.name}" → présent mais header_image ABSENT`);
+      }
+    }
+    syncLog(`[StoreMap] Jeux avec header_image: ${[...storeDetailsMap.values()].filter(d => d.header_image).length}/${storeDetailsMap.size}`);
 
     // ── Step 2b: Enriched app details via steamapis.com (optional) ─────────
     // Cover games played in the last 30 days (not just Steam's 14-day window)
@@ -505,6 +521,7 @@ export async function syncSteamToNotion(
       `Terminé ! ${gamesCount} jeux · ${achievementsCount} succès · ${wishlistCount} souhaits · ${friendsCount} amis · ${badgesCount} badges · ${inventoryCount} objets · ${workshopSyncCount} workshop · ${groupsCount} groupes · ${statsCount} stats`
     );
 
+    closeSyncLog();
     return {
       success: true,
       pageId: mainPage.id,
@@ -532,6 +549,8 @@ export async function syncSteamToNotion(
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "Erreur inconnue lors du sync";
+    syncLog(`[ERREUR] ${message}`);
+    closeSyncLog();
     return { success: false, error: message };
   }
 }
@@ -1028,9 +1047,15 @@ async function syncGames(
     const playerCount = playerCountMap.get(game.appid);
     const steamapisDetails = steamapisDetailsMap.get(game.appid);
 
+    syncLog(
+      `[Game] appId=${game.appid} "${game.name}" — store=${storeDetails ? `OUI (header_image=${storeDetails.header_image ? "OUI" : "NON"})` : "ABSENT"} ` +
+      `existing=${existingEntry ? `OUI (hasGallery=${existingEntry.hasGallery}, hasGalleryV2=${existingEntry.hasGalleryV2})` : "NON"}`
+    );
+
     const properties = buildGameProperties(game, recent, ach, storeDetails, playerCount, steamapisDetails);
     // Prefer header_image from Store API (new Akamai CDN) over constructed hero URL (old CDN, 404 for newer games)
     const coverUrl = storeDetails?.header_image ?? getGameHeroImageUrl(game.appid);
+    syncLog(`[Game] appId=${game.appid} coverUrl=${coverUrl}`);
     const iconUrl = game.img_icon_url
       ? getGameIconUrl(game.appid, game.img_icon_url)
       : null;
@@ -1044,6 +1069,7 @@ async function syncGames(
         })
       );
       if (!existingEntry.hasGallery) {
+        syncLog(`[Gallery] appId=${game.appid} — AJOUT initial`);
         // First time: add gallery blocks, mark both Galerie and Galerie v2 as done
         await notionRetry(() =>
           notion.blocks.children.append({
@@ -1058,6 +1084,7 @@ async function syncGames(
           })
         );
       } else if (!existingEntry.hasGalleryV2 && storeDetails?.header_image) {
+        syncLog(`[Gallery] appId=${game.appid} — MIGRATION v2 (remplacement des anciens blocs)`);
         // One-time migration: replace old cdn.cloudflare blocks with new Akamai URLs
         await replaceGalleryBlocks(notion, existingEntry.pageId, game.appid, storeDetails);
         await notionRetry(() =>
@@ -1066,6 +1093,8 @@ async function syncGames(
             properties: { "Galerie v2": { checkbox: true } },
           })
         );
+      } else {
+        syncLog(`[Gallery] appId=${game.appid} — IGNORÉ (${existingEntry.hasGallery && existingEntry.hasGalleryV2 ? "v2 déjà fait" : "pas de header_image store"})`);
       }
     } else {
       await notionRetry(() =>
