@@ -314,7 +314,22 @@ export interface AppDetails {
   dlc?: number[];
   achievements?: { total: number };
   screenshots?: Array<{ id: number; path_thumbnail: string; path_full: string }>;
+  movies?: Array<{
+    id: number;
+    name: string;
+    thumbnail: string;
+    highlight: boolean;
+    webm?: { "480": string; max: string };
+    mp4?: { "480": string; max: string };
+  }>;
 }
+
+/** Browser-like headers to avoid HTTP 403/400 from Steam's Store API on server-side requests. */
+const STORE_FETCH_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+};
 
 /**
  * Full game metadata from the Steam Store API (no API key required).
@@ -323,7 +338,7 @@ export interface AppDetails {
 export async function getAppDetails(appId: number): Promise<AppDetails | null> {
   const url = `https://store.steampowered.com/api/appdetails?appids=${appId}&cc=fr&l=french`;
   try {
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, { cache: "no-store", headers: STORE_FETCH_HEADERS });
     if (!res.ok) return null;
     const data = (await res.json()) as Record<
       string,
@@ -630,8 +645,9 @@ export async function getWorkshopItems(
 // ─── Bulk Store API ───────────────────────────────────────────────────────────
 
 /**
- * Fetch Store API metadata for many appIds in batches of 50.
+ * Fetch Store API metadata for many appIds concurrently (10 at a time).
  * No API key required. Returns a Map of appId → AppDetails.
+ * Note: the multi-appid batch endpoint returns HTTP 400 — individual requests only.
  */
 export async function getBulkAppDetails(
   appIds: number[]
@@ -641,98 +657,60 @@ export async function getBulkAppDetails(
 
   syncLog(`[StoreAPI] getBulkAppDetails: ${appIds.length} jeux à récupérer`);
 
-  // First pass: batch requests of 50 (unofficial but fast).
-  // NOTE: locale params (cc=fr&l=french) cause HTTP 400 on multi-appid requests;
-  // use the bare endpoint here and let individual retries add locale if needed.
-  const BATCH_SIZE = 50;
-  let batchOk = 0, batchFail = 0;
-  for (let i = 0; i < appIds.length; i += BATCH_SIZE) {
-    const batch = appIds.slice(i, i + BATCH_SIZE);
-    const url =
-      `https://store.steampowered.com/api/appdetails?appids=${batch.join(",")}`;
-    try {
-      const res = await fetch(url, { cache: "no-store" });
-      if (res.ok) {
-        const data = (await res.json()) as Record<
-          string,
-          { success: boolean; data?: AppDetails }
-        >;
-        for (const appId of batch) {
+  const CONCURRENCY = 3;          // 3 requêtes simultanées max pour éviter le rate-limit Steam
+  const BATCH_DELAY_MS = 1500;    // pause entre chaque batch
+  const RETRY_WAIT_MS = 15000;    // attente avant retry en cas de 429
+
+  let ok = 0, fail = 0;
+
+  async function fetchOne(appId: number): Promise<void> {
+    const url = `https://store.steampowered.com/api/appdetails?appids=${appId}&cc=fr&l=french`;
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      try {
+        const res = await fetch(url, { cache: "no-store", headers: STORE_FETCH_HEADERS });
+        if (res.ok) {
+          const data = (await res.json()) as Record<
+            string,
+            { success: boolean; data?: AppDetails }
+          >;
           const entry = data[appId.toString()];
           if (entry?.success && entry.data) {
             result.set(appId, entry.data);
-            batchOk++;
+            ok++;
           } else {
-            batchFail++;
-            syncLog(`[StoreAPI] Batch ÉCHEC appId=${appId} — success=${entry?.success ?? "absent"}`);
+            fail++;
+            syncLog(`[StoreAPI] ÉCHEC appId=${appId} — success=${entry?.success ?? "absent"}`);
           }
+          return;
+        } else if (res.status === 429 && attempt === 0) {
+          syncLog(`[StoreAPI] HTTP 429 appId=${appId} — attente ${RETRY_WAIT_MS}ms puis retry`);
+          await new Promise((r) => setTimeout(r, RETRY_WAIT_MS));
+          // retry (next loop iteration)
+        } else {
+          fail++;
+          syncLog(`[StoreAPI] HTTP ${res.status} appId=${appId}`);
+          return;
         }
-      } else {
-        batchFail += batch.length;
-        syncLog(`[StoreAPI] Batch HTTP ${res.status} pour appIds=${batch.join(",")}`);
-      }
-    } catch (err) {
-      batchFail += batch.length;
-      syncLog(`[StoreAPI] Batch exception: ${String(err)}`);
-    }
-    if (i + BATCH_SIZE < appIds.length) {
-      await new Promise((r) => setTimeout(r, 600));
-    }
-  }
-  syncLog(`[StoreAPI] Passe 1 terminée — OK=${batchOk}, ÉCHEC=${batchFail}`);
-
-  // Second pass: retry games that failed in the batch fetch.
-  // The multi-appid endpoint is unofficial and may silently drop some games;
-  // individual requests (no locale override) are more reliable.
-  const failed = appIds.filter((id) => !result.has(id));
-  syncLog(`[StoreAPI] Passe 2 (individuel) — ${failed.length} jeux à réessayer`);
-  if (failed.length > 0) {
-    const toRetry = failed; // retry ALL failed games
-    const CONCURRENCY = 10;
-    let retryOk = 0, retryFail = 0;
-    for (let i = 0; i < toRetry.length; i += CONCURRENCY) {
-      await Promise.all(
-        toRetry.slice(i, i + CONCURRENCY).map(async (appId) => {
-          try {
-            const url = `https://store.steampowered.com/api/appdetails?appids=${appId}`;
-            const res = await fetch(url, { cache: "no-store" });
-            if (res.ok) {
-              const data = (await res.json()) as Record<
-                string,
-                { success: boolean; data?: AppDetails }
-              >;
-              const entry = data[appId.toString()];
-              if (entry?.success && entry.data) {
-                result.set(appId, entry.data);
-                retryOk++;
-                syncLog(`[StoreAPI] Retry OK appId=${appId} name="${entry.data.name}" header_image=${entry.data.header_image ? "OUI" : "NON"}`);
-              } else {
-                retryFail++;
-                syncLog(`[StoreAPI] Retry ÉCHEC appId=${appId} — success=${entry?.success ?? "absent"}`);
-              }
-            } else {
-              retryFail++;
-              syncLog(`[StoreAPI] Retry HTTP ${res.status} appId=${appId}`);
-            }
-          } catch (err) {
-            retryFail++;
-            syncLog(`[StoreAPI] Retry exception appId=${appId}: ${String(err)}`);
-          }
-        })
-      );
-      if (i + CONCURRENCY < toRetry.length) {
-        await new Promise((r) => setTimeout(r, 400));
+      } catch (err) {
+        fail++;
+        syncLog(`[StoreAPI] Exception appId=${appId}: ${String(err)}`);
+        return;
       }
     }
-    syncLog(`[StoreAPI] Passe 2 terminée — OK=${retryOk}, ÉCHEC=${retryFail}`);
   }
 
-  const finalFailed = appIds.filter((id) => !result.has(id));
-  syncLog(`[StoreAPI] Résultat final — ${result.size} jeux récupérés, ${finalFailed.length} jeux manquants`);
-  if (finalFailed.length > 0) {
-    syncLog(`[StoreAPI] Jeux sans données: ${finalFailed.join(", ")}`);
+  for (let i = 0; i < appIds.length; i += CONCURRENCY) {
+    await Promise.all(appIds.slice(i, i + CONCURRENCY).map(fetchOne));
+    if (i + CONCURRENCY < appIds.length) {
+      await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
+    }
   }
 
+  syncLog(`[StoreAPI] Terminé — OK=${ok}/${appIds.length}, ÉCHEC=${fail}`);
+  const missing = appIds.filter((id) => !result.has(id));
+  if (missing.length > 0) {
+    syncLog(`[StoreAPI] Jeux sans données: ${missing.join(", ")}`);
+  }
   return result;
 }
 

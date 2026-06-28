@@ -780,6 +780,7 @@ function buildLibraryDbSchema() {
     "Portrait (URL)": { url: {} },
     Galerie: { checkbox: {} },
     "Galerie v2": { checkbox: {} },
+    "Galerie v3": { checkbox: {} },
   };
 }
 
@@ -1020,16 +1021,18 @@ async function syncGames(
   // Fetch all existing entries to build an appId → { pageId, hasGallery, hasGalleryV2 } map
   onProgress("Lecture des entrées existantes...");
   const existing = await fetchAllDatabasePages(notion, dbId);
-  const existingByAppId = new Map<number, { pageId: string; hasGallery: boolean; hasGalleryV2: boolean }>();
+  const existingByAppId = new Map<number, { pageId: string; hasGallery: boolean; hasGalleryV2: boolean; hasGalleryV3: boolean }>();
   for (const page of existing) {
     const appIdProp = page.properties["App ID"];
     const galerieProp = page.properties["Galerie"];
     const galerieV2Prop = page.properties["Galerie v2"];
+    const galerieV3Prop = page.properties["Galerie v3"];
     if (appIdProp?.type === "number" && appIdProp.number !== null) {
       existingByAppId.set(appIdProp.number, {
         pageId: page.id,
         hasGallery: galerieProp?.type === "checkbox" ? galerieProp.checkbox : false,
         hasGalleryV2: galerieV2Prop?.type === "checkbox" ? galerieV2Prop.checkbox : false,
+        hasGalleryV3: galerieV3Prop?.type === "checkbox" ? galerieV3Prop.checkbox : false,
       });
     }
   }
@@ -1068,33 +1071,17 @@ async function syncGames(
           cover: { type: "external", external: { url: coverUrl } },
         })
       );
-      if (!existingEntry.hasGallery) {
-        syncLog(`[Gallery] appId=${game.appid} — AJOUT initial`);
-        // First time: add gallery blocks, mark both Galerie and Galerie v2 as done
-        await notionRetry(() =>
-          notion.blocks.children.append({
-            block_id: existingEntry.pageId,
-            children: buildGameImageBlocks(game.appid, storeDetails) as BlockObjectRequest[],
-          })
-        );
+      if (!existingEntry.hasGalleryV3) {
+        syncLog(`[Gallery] appId=${game.appid} — MIGRATION v3 (galerie complète)`);
+        await replaceGalleryBlocks(notion, existingEntry.pageId, game.appid, storeDetails, game.img_icon_url);
         await notionRetry(() =>
           notion.pages.update({
             page_id: existingEntry.pageId,
-            properties: { Galerie: { checkbox: true }, "Galerie v2": { checkbox: true } },
-          })
-        );
-      } else if (!existingEntry.hasGalleryV2 && storeDetails?.header_image) {
-        syncLog(`[Gallery] appId=${game.appid} — MIGRATION v2 (remplacement des anciens blocs)`);
-        // One-time migration: replace old cdn.cloudflare blocks with new Akamai URLs
-        await replaceGalleryBlocks(notion, existingEntry.pageId, game.appid, storeDetails);
-        await notionRetry(() =>
-          notion.pages.update({
-            page_id: existingEntry.pageId,
-            properties: { "Galerie v2": { checkbox: true } },
+            properties: { Galerie: { checkbox: true }, "Galerie v2": { checkbox: true }, "Galerie v3": { checkbox: true } },
           })
         );
       } else {
-        syncLog(`[Gallery] appId=${game.appid} — IGNORÉ (${existingEntry.hasGallery && existingEntry.hasGalleryV2 ? "v2 déjà fait" : "pas de header_image store"})`);
+        syncLog(`[Gallery] appId=${game.appid} — IGNORÉ (v3 déjà appliqué)`);
       }
     } else {
       await notionRetry(() =>
@@ -1104,9 +1091,9 @@ async function syncGames(
           ...(iconUrl
             ? { icon: { type: "external", external: { url: iconUrl } } }
             : {}),
-          properties: { ...properties, Galerie: { checkbox: true }, "Galerie v2": { checkbox: true } },
+          properties: { ...properties, Galerie: { checkbox: true }, "Galerie v2": { checkbox: true }, "Galerie v3": { checkbox: true } },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          children: buildGameImageBlocks(game.appid, storeDetails) as any,
+          children: buildGameImageBlocks(game.appid, storeDetails, game.img_icon_url) as any,
         })
       );
     }
@@ -1120,15 +1107,14 @@ async function syncGames(
 }
 
 /**
- * Replaces the "Galerie" section in a Notion page (heading_3 + image blocks)
- * with fresh blocks using correct Store API URLs.
- * Used for one-time migration from old cdn.cloudflare URLs to new Akamai URLs.
+ * Replaces the "Galerie" section in a Notion page with the full v3 asset set.
  */
 async function replaceGalleryBlocks(
   notion: Client,
   pageId: string,
   appId: number,
-  store: AppDetails
+  store: AppDetails | undefined,
+  iconHash?: string
 ): Promise<void> {
   // 1. List child blocks to find old gallery section
   const { results } = await notionRetry(() =>
@@ -1168,19 +1154,22 @@ async function replaceGalleryBlocks(
     }
   }
 
-  // 4. Append fresh gallery blocks with correct Akamai URLs
+  // 4. Append fresh gallery blocks with all library assets
   await notionRetry(() =>
     notion.blocks.children.append({
       block_id: pageId,
-      children: buildGameImageBlocks(appId, store) as BlockObjectRequest[],
+      children: buildGameImageBlocks(appId, store, iconHash) as BlockObjectRequest[],
     })
   );
 }
 
-function buildGameImageBlocks(appId: number, store?: AppDetails): BlockObjectRequest[] {
-  // Prefer header_image from Store API (new Akamai CDN) — old cdn.cloudflare header.jpg returns 404 for newer games
-  const headerUrl = store?.header_image
-    ?? `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
+function buildGameImageBlocks(appId: number, store?: AppDetails, iconHash?: string): BlockObjectRequest[] {
+  const CDN = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}`;
+
+  const img = (url: string): BlockObjectRequest => ({
+    type: "image",
+    image: { type: "external", external: { url } },
+  });
 
   const blocks: BlockObjectRequest[] = [
     {
@@ -1191,22 +1180,31 @@ function buildGameImageBlocks(appId: number, store?: AppDetails): BlockObjectReq
         is_toggleable: false,
       },
     },
-    {
-      type: "image",
-      image: {
-        type: "external",
-        external: { url: headerUrl },
-      },
-    },
   ];
 
-  // Use screenshots from Store API (guaranteed to exist) — up to 4
+  if (store) {
+    // Assets CDN librairie — existent uniquement pour les jeux avec une page Store
+    blocks.push(img(`${CDN}/library_hero.jpg`));       // Banner héro (1920×620)
+    blocks.push(img(`${CDN}/library_600x900.jpg`));    // Portrait librairie (600×900)
+    blocks.push(img(store.header_image ?? `${CDN}/header.jpg`));          // Header store (460×215)
+    blocks.push(img(store.capsule_image ?? `${CDN}/capsule_616x353.jpg`)); // Capsule medium (616×353)
+    blocks.push(img(`${CDN}/capsule_231x87.jpg`));     // Capsule small (231×87)
+    blocks.push(img(`${CDN}/logo.png`));               // Logo transparent
+  } else {
+    // Jeu sans page Store (DLC, outil...) — uniquement les assets garantis
+    blocks.push(img(`${CDN}/header.jpg`));
+    blocks.push(img(`${CDN}/capsule_616x353.jpg`));
+  }
+
+  // Icône du jeu (hash disponible via l'API owned games)
+  if (iconHash) {
+    blocks.push(img(`https://media.steampowered.com/steamcommunity/public/images/apps/${appId}/${iconHash}.jpg`));
+  }
+
+  // Screenshots du Store API (jusqu'à 8, URLs garanties)
   if (store?.screenshots?.length) {
-    for (const ss of store.screenshots.slice(0, 4)) {
-      blocks.push({
-        type: "image",
-        image: { type: "external", external: { url: ss.path_full } },
-      });
+    for (const ss of store.screenshots.slice(0, 8)) {
+      blocks.push(img(ss.path_full));
     }
   }
 
