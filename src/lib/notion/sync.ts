@@ -802,13 +802,42 @@ function buildWishlistDbSchema() {
     Jeu: { title: {} },
     "App ID": { number: { format: "number" } },
     "Page Steam": { url: {} },
+    "Site web": { url: {} },
     Genres: { multi_select: { options: [] } },
+    Catégories: { multi_select: { options: [] } },
     Développeur: { rich_text: {} },
+    Éditeur: { rich_text: {} },
+    Description: { rich_text: {} },
     Gratuit: { checkbox: {} },
     "Prix (€)": { number: { format: "number" } },
     "Prix initial (€)": { number: { format: "number" } },
     "Remise (%)": { number: { format: "number" } },
     Metacritic: { number: { format: "number" } },
+    Recommandations: { number: { format: "number" } },
+    "Total succès": { number: { format: "number" } },
+    "Nombre de DLC": { number: { format: "number" } },
+    "Âge requis": { number: { format: "number" } },
+    "Date de sortie": { date: {} },
+    Plateformes: {
+      multi_select: {
+        options: [
+          { name: "Windows", color: "blue" },
+          { name: "Mac", color: "gray" },
+          { name: "Linux", color: "orange" },
+        ],
+      },
+    },
+    "Support manette": {
+      select: {
+        options: [
+          { name: "Complet", color: "green" },
+          { name: "Partiel", color: "yellow" },
+          { name: "Aucun", color: "gray" },
+        ],
+      },
+    },
+    "Header (URL)": { url: {} },
+    "Capsule (URL)": { url: {} },
     Priorité: { number: { format: "number" } },
     "Date d'ajout": { date: {} },
   };
@@ -1954,17 +1983,48 @@ async function syncWishlist(
           multi_select: store.genres.map((g) => ({ name: g.description })),
         };
       }
+      if (store.categories?.length) {
+        properties["Catégories"] = {
+          multi_select: store.categories.slice(0, 20).map((c) => ({ name: c.description })),
+        };
+        const hasFull = store.categories.some((c) => c.id === 28);
+        const hasPartial = store.categories.some((c) => c.id === 18);
+        if (hasFull) properties["Support manette"] = { select: { name: "Complet" } };
+        else if (hasPartial) properties["Support manette"] = { select: { name: "Partiel" } };
+        else properties["Support manette"] = { select: { name: "Aucun" } };
+      }
       if (store.developers?.length) {
         properties["Développeur"] = {
           rich_text: [{ text: { content: store.developers.join(", ") } }],
         };
       }
+      if (store.publishers?.length) {
+        properties["Éditeur"] = {
+          rich_text: [{ text: { content: store.publishers.join(", ") } }],
+        };
+      }
+      if (store.short_description) {
+        properties["Description"] = {
+          rich_text: [{ text: { content: store.short_description.slice(0, 2000) } }],
+        };
+      }
+      if (store.release_date && !store.release_date.coming_soon) {
+        const parsed = parseSteamDate(store.release_date.date);
+        if (parsed) properties["Date de sortie"] = { date: { start: parsed } };
+      }
+      if (store.platforms) {
+        const plats: string[] = [];
+        if (store.platforms.windows) plats.push("Windows");
+        if (store.platforms.mac) plats.push("Mac");
+        if (store.platforms.linux) plats.push("Linux");
+        if (plats.length > 0) {
+          properties["Plateformes"] = { multi_select: plats.map((p) => ({ name: p })) };
+        }
+      }
       properties["Gratuit"] = { checkbox: store.is_free };
       if (!store.is_free && store.price_overview) {
         const po = store.price_overview;
-        // Current (discounted) price
         properties["Prix (€)"] = { number: po.final / 100 };
-        // Original price (only differs when there's a discount)
         if (po.discount_percent > 0) {
           properties["Prix initial (€)"] = { number: po.initial / 100 };
           properties["Remise (%)"] = { number: po.discount_percent };
@@ -1973,9 +2033,30 @@ async function syncWishlist(
       if (store.metacritic?.score) {
         properties["Metacritic"] = { number: store.metacritic.score };
       }
+      if (store.recommendations?.total) {
+        properties["Recommandations"] = { number: store.recommendations.total };
+      }
+      if (store.achievements?.total) {
+        properties["Total succès"] = { number: store.achievements.total };
+      }
+      if (store.dlc?.length) {
+        properties["Nombre de DLC"] = { number: store.dlc.length };
+      }
+      const requiredAge = Number(store.required_age ?? 0);
+      if (requiredAge > 0) {
+        properties["Âge requis"] = { number: requiredAge };
+      }
+      if (store.website) {
+        properties["Site web"] = { url: store.website };
+      }
+      properties["Header (URL)"] = { url: store.header_image ?? getGameHeaderImageUrl(item.appid) };
+      properties["Capsule (URL)"] = { url: store.capsule_image ?? getGameCapsuleImageUrl(item.appid) };
+    } else {
+      properties["Header (URL)"] = { url: getGameHeaderImageUrl(item.appid) };
+      properties["Capsule (URL)"] = { url: getGameCapsuleImageUrl(item.appid) };
     }
 
-    const coverUrl = getGameHeroImageUrl(item.appid);
+    const coverUrl = store?.header_image ?? getGameHeroImageUrl(item.appid);
     const iconUrl = getGameHeaderImageUrl(item.appid);
     const existingPageId = existingByAppId.get(item.appid);
     if (existingPageId) {
