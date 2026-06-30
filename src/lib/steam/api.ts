@@ -635,9 +635,9 @@ export async function getWorkshopItems(
   }>("IPublishedFileService/GetUserFiles/v1/", {
     steamid: steamId,
     numperpage: "100",
-    type: "0",
     return_tags: "1",
     return_previews: "1",
+    return_metadata: "1",
   });
   return data?.response?.publishedfiledetails ?? [];
 }
